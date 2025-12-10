@@ -19,7 +19,7 @@ from vllm.logger import logger
 
 TORCHAIR_MODEL_LIST = ["deepseek", "pangu", "kimi_k2", "qwen"]
 
-
+# print1
 def _check_torchair_supported(model_type: str):
     for supported_model in TORCHAIR_MODEL_LIST:
         if supported_model in model_type.lower():

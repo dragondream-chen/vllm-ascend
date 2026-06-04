@@ -15,6 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import math
 import torch
 import torch_npu
 
@@ -24,6 +25,8 @@ from vllm_ascend.device.mxfp_compat import (
     HIFLOAT8_DTYPE,
 )
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+_FP8_PER_HEAD_SCALE_ELEMS = 4
 
 
 class BaseDeviceAdaptor:
@@ -197,6 +200,90 @@ class BaseDeviceAdaptor:
             seq_starts=seq_starts,
             key=key,
             value=value,
+        )
+
+    @staticmethod
+    def fp8_per_head_scale_elems_padded(block_size, num_kv_heads, head_size):
+        raw = _FP8_PER_HEAD_SCALE_ELEMS
+        unit = head_size // math.gcd(block_size, head_size)
+        elems = ((raw + unit - 1) // unit) * unit
+        return elems
+
+    @staticmethod
+    def needs_per_head_scale_in_cache(kv_cache_quant_config):
+        if kv_cache_quant_config is None:
+            return False
+        if kv_cache_quant_config.k_quant is not None:
+            if kv_cache_quant_config.k_quant.granularity == "per_token_per_head":
+                return True
+        if kv_cache_quant_config.v_quant is not None:
+            if kv_cache_quant_config.v_quant.granularity == "per_token_per_head":
+                return True
+        return False
+
+    @staticmethod
+    def split_fp8_kv_data_and_scale(kv_cache_fp8, head_size, kv_cache_quant_config):
+        if not BaseDeviceAdaptor.needs_per_head_scale_in_cache(kv_cache_quant_config):
+            return kv_cache_fp8, None
+
+        num_blocks = kv_cache_fp8.shape[1]
+        block_size = kv_cache_fp8.shape[2]
+        num_kv_heads = kv_cache_fp8.shape[3]
+        pad_head_size = kv_cache_fp8.shape[4]
+        pad_total_row = block_size * pad_head_size // head_size
+
+        s = kv_cache_fp8.stride()
+        kv_cache_fp8 = torch.as_strided(
+            kv_cache_fp8,
+            (2, num_blocks, pad_total_row, num_kv_heads, head_size),
+            (s[0], s[1], num_kv_heads * head_size, head_size, 1),
+        )
+        kv_data = kv_cache_fp8[:, :, :block_size, :, :]
+        kv_scale = kv_cache_fp8[:, :, block_size:, :, :]
+        return kv_data, kv_scale
+
+    @staticmethod
+    def split_fp8_kv_cache_and_scale(kv_cache_fp8, head_size, kv_cache_quant_config):
+        if not BaseDeviceAdaptor.needs_per_head_scale_in_cache(kv_cache_quant_config):
+            return kv_cache_fp8, None
+
+        num_blocks = kv_cache_fp8.shape[0]
+        num_kv_heads = kv_cache_fp8.shape[1]
+        block_size = kv_cache_fp8.shape[2]
+        pad_head_size = kv_cache_fp8.shape[3]
+
+        pad_total_row = block_size * pad_head_size // head_size
+
+        s = kv_cache_fp8.stride()
+        kv_cache_fp8 = torch.as_strided(
+            kv_cache_fp8,
+            (num_blocks, num_kv_heads, pad_total_row, head_size),
+            (s[0], s[1], head_size, 1),
+        )
+        kv_data = kv_cache_fp8[:, :, :block_size, :]
+        kv_scale = kv_cache_fp8[:, :, block_size:, :]
+        return kv_data, kv_scale
+
+    @staticmethod
+    def reshape_and_cache_fp8(
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_scale=None,
+        kv_offset=None,
+    ):
+        torch_npu.mytest_rope_norm_store_kv_fp8(
+            query=query,
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
+            kv_scale=kv_scale,
+            kv_offset=kv_offset,
         )
 
 

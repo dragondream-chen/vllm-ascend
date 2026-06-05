@@ -15,6 +15,8 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import math
+
 import torch
 import torch_npu
 
@@ -24,6 +26,8 @@ from vllm_ascend.device.mxfp_compat import (
     HIFLOAT8_DTYPE,
 )
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+_FP8_PER_HEAD_SCALE_ELEMS = 4
 
 
 class BaseDeviceAdaptor:
@@ -198,6 +202,53 @@ class BaseDeviceAdaptor:
             key=key,
             value=value,
         )
+
+    @staticmethod
+    def fp8_per_head_scale_elems_padded(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> int:
+        raw = _FP8_PER_HEAD_SCALE_ELEMS
+        unit = head_size // math.gcd(block_size, head_size)
+        return ((raw + unit - 1) // unit) * unit
+
+    @staticmethod
+    def needs_per_head_scale_in_cache(kv_cache_quant_config) -> bool:
+        if kv_cache_quant_config is None:
+            return False
+        for spec in (kv_cache_quant_config.k_quant, kv_cache_quant_config.v_quant):
+            if spec is not None and spec.granularity == "per_token_per_head":
+                return True
+        return False
+
+    @staticmethod
+    def split_fp8_kv_cache_and_scale(
+        kv_cache_fp8: torch.Tensor,
+        head_size: int,
+        kv_cache_quant_config,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not BaseDeviceAdaptor.needs_per_head_scale_in_cache(kv_cache_quant_config):
+            return kv_cache_fp8, None
+
+        num_blocks = kv_cache_fp8.shape[0]
+        block_size = kv_cache_fp8.shape[1]
+        num_kv_heads = kv_cache_fp8.shape[2]
+        pad_head_size = kv_cache_fp8.shape[3]
+        pad_total_rows = block_size * pad_head_size // head_size
+
+        # Logical shape is (B, BS, H, D_pad). Move to the BNBD physical view,
+        # fold padded head bytes into extra rows, then expose logical NHD data.
+        kv_cache_bnbd = kv_cache_fp8.permute(0, 2, 1, 3)
+        s = kv_cache_bnbd.stride()
+        kv_cache_bnbd = torch.as_strided(
+            kv_cache_bnbd,
+            (num_blocks, num_kv_heads, pad_total_rows, head_size),
+            (s[0], s[1], head_size, 1),
+        )
+        kv_data = kv_cache_bnbd[:, :, :block_size, :].permute(0, 2, 1, 3)
+        kv_scale = kv_cache_bnbd[:, :, block_size:, :].permute(0, 2, 1, 3)
+        return kv_data, kv_scale
 
 
 class A5DeviceAdaptor(BaseDeviceAdaptor):

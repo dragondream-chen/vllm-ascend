@@ -2912,6 +2912,7 @@ class NPUModelRunner(GPUModelRunner):
                             block_size,
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         )
                         if self.hybrid_with_attn_and_mamba:
                             attn_tensor_page_size = int(np.prod(kv_cache_shape[1:])) * get_dtype_size(
@@ -2927,6 +2928,7 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.block_size,
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         )
                     if not isinstance(current_kv_cache_spec, MLAAttentionSpec):
                         k_shape = kv_cache_shape[1:]
@@ -2951,12 +2953,39 @@ class NPUModelRunner(GPUModelRunner):
                             v_dim,
                         )
                     k_cache_dtype = v_cache_dtype = current_kv_cache_spec.dtype
+                    cache_dtype_str = self.vllm_config.cache_config.cache_dtype
+                    if cache_dtype_str in ("fp8", "fp8_e4m3"):
+                        k_cache_dtype = v_cache_dtype = torch.float8_e4m3fn
                     if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
                         k_cache_dtype, v_cache_dtype = self.vllm_config.quant_config.get_kv_quant_dtype(
                             layer_name, current_kv_cache_spec.dtype, self.model_config
                         )
                     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
                     v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+                    if cache_dtype_str in ("fp8", "fp8_e4m3") and not isinstance(
+                        current_kv_cache_spec, MLAAttentionSpec
+                    ):
+                        try:
+                            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                        except (AttributeError, NotImplementedError):
+                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                        kv_cache_stride_order_4d = tuple(i - 1 for i in kv_cache_stride_order[1:])
+                        inv_order_4d = [
+                            kv_cache_stride_order_4d.index(i)
+                            for i in range(len(kv_cache_stride_order_4d))
+                        ]
+                        k_shape_physical = tuple(k_shape[i] for i in kv_cache_stride_order_4d)
+                        v_shape_physical = tuple(v_shape[i] for i in kv_cache_stride_order_4d)
+                        k_cache = (
+                            raw_k_tensor.view(k_cache_dtype)
+                            .view(k_shape_physical)
+                            .permute(*inv_order_4d)
+                        )
+                        v_cache = (
+                            raw_v_tensor.view(v_cache_dtype)
+                            .view(v_shape_physical)
+                            .permute(*inv_order_4d)
+                        )
 
                     if self.use_sparse:
                         dsa_k_cache_shape = (

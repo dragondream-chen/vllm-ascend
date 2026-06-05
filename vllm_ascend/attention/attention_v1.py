@@ -17,6 +17,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 
 import torch
 import torch_npu
@@ -94,8 +95,62 @@ class AscendAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
+        cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str in ("fp8", "fp8_e4m3"):
+            padded = AscendAttentionBackend._fp8_per_head_scale_elems_padded(
+                block_size, num_kv_heads, head_size
+            )
+            return (
+                2,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size + padded,
+            )
         return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_page_size_padded(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        head_size_v: int,
+        dtype: torch.dtype,
+        cache_dtype_str: str = "auto",
+    ) -> int | None:
+        if cache_dtype_str not in ("fp8", "fp8_e4m3"):
+            return None
+        from vllm.utils.torch_utils import get_dtype_size
+
+        assert head_size == head_size_v, "head_size must equal head_size_v for FP8 KV cache"
+        padded = AscendAttentionBackend._fp8_per_head_scale_elems_padded(
+            block_size, num_kv_heads, head_size
+        )
+        return (
+            block_size
+            * num_kv_heads
+            * (head_size + padded + head_size_v + padded)
+            * get_dtype_size(dtype)
+        )
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (0, 1, 2, 4, 3, 5)
+        return (0, 1, 3, 2, 4)
+
+    @staticmethod
+    def _fp8_per_head_scale_elems_padded(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> int:
+        raw = 4
+        unit = head_size // math.gcd(block_size, head_size)
+        return ((raw + unit - 1) // unit) * unit
 
     @staticmethod
     def swap_blocks(
@@ -200,6 +255,12 @@ class AscendMetadata:
 
     # sliding window attention mask
     swa_mask: torch.Tensor | None = None
+
+    # FP8 Hunyuan V3 path. Populated by NpuRopeNorm and consumed by
+    # AscendAttentionBackendImpl when the FIA FP8 contract needs scales.
+    npu_prefill_q_scale: torch.Tensor | None = None
+    npu_decode_q_scale: torch.Tensor | None = None
+    npu_split_k_flag: torch.Tensor | None = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -383,6 +444,56 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
         self.sinks = sinks
+        self.use_fp8_kv_cache = kv_cache_dtype in ("fp8", "fp8_e4m3")
+        self.use_npu_rope_norm = False
+        self._kv_cache_quant_config = None
+        self._quant_type = None
+        if self.use_fp8_kv_cache:
+            self._kv_cache_quant_config = self._resolve_kv_cache_quant_config()
+            self._quant_type = self._resolve_quant_type()
+
+    def _resolve_kv_cache_quant_config(self):
+        cache_config = self.vllm_config.cache_config
+        if cache_config is not None and cache_config.kv_cache_quant_config is not None:
+            return cache_config.kv_cache_quant_config
+
+        from vllm.config.cache import KVCacheQuantConfig, KVQuantSpec
+
+        return KVCacheQuantConfig(
+            k_quant=KVQuantSpec(dtype="fp8_e4m3", granularity="per_token_per_head"),
+            v_quant=KVQuantSpec(dtype="fp8_e4m3", granularity="per_head"),
+        )
+
+    def _resolve_quant_type(self) -> int:
+        # The fused NPU rope_norm op uses the same policy value as the current
+        # Hunyuan V3 prototype: Q per-token-per-head, K per-token-per-head,
+        # V per-head.
+        return 1
+
+    def _get_kv_scales(self, layer: AttentionLayer,
+                       k_scale_from_cache: torch.Tensor | None,
+                       v_scale_from_cache: torch.Tensor | None):
+        kv_qcfg = self._kv_cache_quant_config
+
+        if kv_qcfg is not None:
+            if kv_qcfg.k_quant is not None and kv_qcfg.k_quant.granularity == "per_token_per_head":
+                k_scale = k_scale_from_cache.view(torch.float32) if k_scale_from_cache is not None else layer._k_scale
+            elif kv_qcfg.k_quant is not None and kv_qcfg.k_quant.granularity == "per_head":
+                k_scale = layer._k_scale
+            else:
+                k_scale = layer._k_scale.reshape(1)
+
+            if kv_qcfg.v_quant is not None and kv_qcfg.v_quant.granularity == "per_token_per_head":
+                v_scale = v_scale_from_cache.view(torch.float32) if v_scale_from_cache is not None else layer._v_scale
+            elif kv_qcfg.v_quant is not None and kv_qcfg.v_quant.granularity == "per_head":
+                v_scale = layer._v_scale
+            else:
+                v_scale = layer._v_scale.reshape(1)
+        else:
+            k_scale = layer._k_scale.reshape(1)
+            v_scale = layer._v_scale.reshape(1)
+
+        return k_scale, v_scale
 
     @staticmethod
     def update_graph_params(
@@ -895,15 +1006,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            DeviceOperator.reshape_and_cache(
-                key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
-                value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                # quick fix to make sure slots is int32 for cross attention case.
-                # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
-                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
-            )
+            if not self.use_npu_rope_norm:
+                DeviceOperator.reshape_and_cache(
+                    key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
+                    value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    # quick fix to make sure slots is int32 for cross attention case.
+                    # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
+                    slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
+                )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
         return query, key, value, output
@@ -918,7 +1030,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
-        if (
+        if self.use_npu_rope_norm and self.use_fp8_kv_cache:
+            output = self._forward_fp8_attention(query, kv_cache, attn_metadata, output)
+        elif (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and using_paged_attention(num_tokens, self.vllm_config)
             and self.sliding_window is None
@@ -927,6 +1041,83 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output)
 
+        return output
+
+    def _forward_fp8_attention(
+        self,
+        query: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        key_cache = (
+            kv_cache[0].view(torch.float8_e4m3fn)
+            if kv_cache[0].dtype != torch.float8_e4m3fn
+            else kv_cache[0]
+        )
+        value_cache = (
+            kv_cache[1].view(torch.float8_e4m3fn)
+            if kv_cache[1].dtype != torch.float8_e4m3fn
+            else kv_cache[1]
+        )
+
+        k_data, k_scale_from_cache = DeviceOperator.split_fp8_kv_cache_and_scale(
+            key_cache, self.head_size, self._kv_cache_quant_config
+        )
+        v_data, _ = DeviceOperator.split_fp8_kv_cache_and_scale(
+            value_cache, self.head_size, self._kv_cache_quant_config
+        )
+        # K scale is embedded in the cache for the Hunyuan V3 FP8 path.
+        # It is kept available for FIA variants that require explicit scales.
+        _ = k_scale_from_cache
+
+        num_blocks = k_data.shape[0]
+        block_size = k_data.shape[1]
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+
+        # The cache is exposed as logical (B, BS, H, D) while the underlying
+        # allocation is BNBD. This reshape uses the physical BNBD view and
+        # avoids a data copy when strides match.
+        k_flat = k_data.permute(0, 2, 1, 3).reshape(
+            num_blocks, self.num_kv_heads, block_size * self.head_size
+        )
+        v_flat = v_data.permute(0, 2, 1, 3).reshape(
+            num_blocks, self.num_kv_heads, block_size * self.head_size
+        )
+
+        block_table = attn_metadata.block_tables
+        actual_seq_lengths_kv = attn_metadata.seq_lens_list
+        if (
+            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            and self.attn_type != AttentionType.ENCODER_DECODER
+        ):
+            block_table = None
+            actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
+            k_flat = k_flat[:, :, : num_tokens * self.head_size].reshape(
+                num_tokens, self.num_kv_heads, self.head_size
+            )
+            v_flat = v_flat[:, :, : num_tokens * self.head_size].reshape(
+                num_tokens, self.num_kv_heads, self.head_size
+            )
+
+        query = query[:num_tokens]
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=k_flat,
+            value=v_flat,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="BND",
+            block_size=block_size,
+            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=3,
+        )
+        attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        output[:num_tokens] = attn_output[:num_tokens]
         return output
 
     def forward(
@@ -957,7 +1148,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")
 
-        assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
+        if not (self.use_npu_rope_norm and self.use_fp8_kv_cache):
+            assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)

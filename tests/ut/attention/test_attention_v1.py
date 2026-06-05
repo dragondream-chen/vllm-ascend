@@ -45,6 +45,20 @@ class TestAscendAttentionBackend(TestBase):
         result = AscendAttentionBackend.get_kv_cache_shape(10, 20, 30, 40)
         self.assertEqual(result, (2, 10, 20, 30, 40))
 
+    def test_get_kv_cache_shape_fp8(self):
+        result = AscendAttentionBackend.get_kv_cache_shape(
+            10, 128, 8, 128, cache_dtype_str="fp8_e4m3")
+        self.assertEqual(result, (2, 10, 128, 8, 132))
+
+    def test_get_kv_cache_page_size_padded_fp8(self):
+        result = AscendAttentionBackend.get_kv_cache_page_size_padded(
+            128, 8, 128, 128, torch.float8_e4m3fn, "fp8_e4m3")
+        self.assertEqual(result, 128 * 8 * (132 + 132))
+
+    def test_get_kv_cache_stride_order(self):
+        self.assertEqual(AscendAttentionBackend.get_kv_cache_stride_order(),
+                         (0, 1, 3, 2, 4))
+
     def test_swap_blocks(self):
         src_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]
         dst_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]

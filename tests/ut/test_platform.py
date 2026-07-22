@@ -8,7 +8,11 @@ from vllm.platforms import PlatformEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_profile_run
+from vllm_ascend.ascend_forward_context import (
+    MoECommType,
+    _ExtraForwardContextProxy,
+    override_mrv2_in_profile_run,
+)
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
@@ -274,6 +278,8 @@ class TestNPUPlatform(TestBase):
         self.assertFalse(kwargs["in_profile_run"])
         self.assertEqual(kwargs["padded_num_tokens"], 8)
         self.assertIs(kwargs["moe_comm_method"], dummy_comm_method)
+        self.assertFalse(set(kwargs) - set(_ExtraForwardContextProxy.extra_attrs))
+        self.assertIn("input_ids", _ExtraForwardContextProxy.extra_attrs)
 
     def test_set_additional_forward_context_reads_v2_profile_override(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()

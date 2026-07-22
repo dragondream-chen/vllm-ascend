@@ -70,8 +70,15 @@ class AscendModelState(DefaultModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
+            num_computed_tokens_cpu=torch.from_numpy(input_batch.num_computed_tokens_np),
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
+            graph_pad_size=num_tokens - input_batch.num_tokens,
+            # DSA consumes positions only for real scheduled tokens. In full
+            # graph mode the remaining entries are graph padding and must not
+            # participate in compressor/indexer metadata.
+            num_input_tokens=input_batch.num_tokens,
+            num_reqs_actual=input_batch.num_reqs,
             for_cudagraph_capture=for_capture,
         )
         return self.attn_metadata

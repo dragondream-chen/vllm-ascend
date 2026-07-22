@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -38,16 +39,68 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, extract_layer_index
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.utils import calc_split_factor
+from vllm_ascend.utils import AscendDeviceType, calc_split_factor, get_ascend_device_type
 
 _ATTENTION_MASK_BUILDER = None
+
+
+def _is_dsv4_cache_layer(layer: Attention) -> bool:
+    """Whether ``layer`` owns a DeepSeek-V4 DSA cache."""
+    layer_cls = type(layer)
+    return (
+        layer_cls.__module__ == "vllm_ascend.models.layer.attention.layer"
+        and layer_cls.__name__ == "DSAAttention"
+    ) or layer_cls.__module__ == "vllm_ascend.models.deepseek_v4"
+
+
+def bind_kv_cache(
+    kv_caches: dict[str, Any],
+    forward_context: dict[str, Attention],
+    runner_kv_caches: list[Any],
+    num_attn_module: int = 1,
+) -> None:
+    """Bind MRV2 KV caches, preserving MRV1's DeepSeek-V4 DSA ABI.
+
+    Upstream's helper rejects the NPU case where a decoder layer owns several
+    DSA cache tensors.  DSA also requires every cache owner to retain a
+    single-element virtual-engine list, unlike ordinary MRV2 attention.
+    """
+    assert len(runner_kv_caches) == 0
+
+    dsv4_layer_names = [
+        layer_name for layer_name in kv_caches if _is_dsv4_cache_layer(forward_context[layer_name])
+    ]
+    if dsv4_layer_names and len(dsv4_layer_names) == len(kv_caches):
+        # Keep exactly the MRV1 DeepSeek-V4 cache order. MTP layers follow
+        # the main model layers, then cache-owner names make the order stable
+        # within a transformer layer.
+        for layer_name in sorted(
+            dsv4_layer_names,
+            key=lambda name: (".mtp." in f".{name}.", extract_layer_index(name), name),
+        ):
+            runner_kv_caches.append(kv_caches[layer_name])
+        for layer_name, kv_cache in kv_caches.items():
+            forward_context[layer_name].kv_cache = [kv_cache]
+        return
+
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+    for layer_index in sorted(index2name):
+        for layer_name in index2name[layer_index]:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        layer = forward_context[layer_name]
+        layer.kv_cache = [kv_cache] if _is_dsv4_cache_layer(layer) else kv_cache
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -59,6 +112,11 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             continue
+        # DSA owns several cache-only AttentionLayerBase modules in addition
+        # to the main DSAAttention layer (SWA, compressor state and, for c4,
+        # indexer state/K).  Do not limit this discovery to Attention and
+        # MLAAttention: doing so silently drops those cache groups in v2.
+        # Keep the MLA rewrite below for ordinary upstream MLA layers only.
         if isinstance(attn_module, Attention):
             if spec := attn_module.get_kv_cache_spec(vllm_config):
                 kv_cache_spec[layer_name] = spec
@@ -81,6 +139,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
             )
+            continue
+
+        if spec := attn_module.get_kv_cache_spec(vllm_config):
+            kv_cache_spec[layer_name] = spec
 
     return kv_cache_spec
 
@@ -118,6 +180,7 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
+    num_reqs_actual: int | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -130,6 +193,13 @@ def build_attn_metadata(
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    # DSA metadata is built once per cache group, but compressor/indexer
+    # metadata must share these step-local objects across all ratios.  They
+    # deliberately live only for this invocation: retaining them across
+    # execute steps would reuse request-specific SAS/QLI tensors.
+    prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
+    decode_ratio_to_sas_metadata: dict[Any, Any] = {}
+    common_ratio_to_sas_metadata: dict[Any, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
@@ -147,6 +217,7 @@ def build_attn_metadata(
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
@@ -165,7 +236,8 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
+            is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
+            if for_cudagraph_capture and not is_dsa_builder:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
                 attn_metadata_extra_kwargs = (
@@ -176,11 +248,26 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
+                if is_dsa_builder:
+                    attn_metadata_extra_kwargs.update(
+                        num_reqs_actual=num_reqs if num_reqs_actual is None else num_reqs_actual,
+                        prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
+                        decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
+                        common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                        block_size=attn_group.kv_cache_spec.block_size,
+                    )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if is_dsa_builder:
+                    # Keep the exact objects selected by the builder.  This
+                    # also covers builders which replace an empty dict during
+                    # graph capture.
+                    prefill_ratio_to_sas_metadata = attn_metadata_builder.prefill_ratio_to_sas_metadata
+                    decode_ratio_to_sas_metadata = attn_metadata_builder.decode_ratio_to_sas_metadata
+                    common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
@@ -243,12 +330,91 @@ def _get_attention_kv_cache_dims(layer_name: str, kv_cache_spec: AttentionSpec) 
     if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
         attn_layers = get_layers_from_vllm_config(get_current_vllm_config(), AttentionLayerBase, [layer_name])
         attn_layer = attn_layers[layer_name]
+        # DeepSeek-V4 DSA caches are a single physical tensor.  They must not
+        # take the MLA's two-buffer (nope/rope) allocation path.
+        if getattr(kv_cache_spec, "model_version", None) == "deepseek_v4":
+            return kv_cache_spec.head_size, 0
         if not isinstance(attn_layer, MLAAttention):
             raise TypeError(f"Expected AscendMLAAttention layer for {layer_name}, got {type(attn_layer).__name__}.")
         return attn_layer.kv_lora_rank, attn_layer.qk_rope_head_dim
 
     head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
     return kv_cache_spec.head_size, head_size_v
+
+
+def _is_dsv4_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Whether a spec is one of DeepSeek-V4's single-buffer DSA caches."""
+    return getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
+
+
+def _dsv4_physical_page_size(kv_cache_spec: AttentionSpec) -> int:
+    """Return the byte stride of one physical DSA cache page.
+
+    DSA pages can hold both indexer K and scale data.  Consequently they must
+    retain the cache spec's physical block geometry, even when another member
+    of the hybrid group selects a smaller kernel block size.
+    """
+    return kv_cache_spec.page_size_bytes
+
+
+def _view_dsv4_cache(
+    raw_tensor: torch.Tensor,
+    kv_cache_spec: AttentionSpec,
+    backend: AttentionBackend,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Create physical DSA cache view(s) without applying MLA K/V splitting.
+
+    c4 indexer pages contain K and scale data. Every other DSA owner is a
+    single tensor.  Unlike ordinary hybrid caches, DSA must not be converted
+    to the group's kernel block size: indexer scale data is laid out after the
+    complete K portion of each physical page, so splitting a page would make
+    a regular strided scale view impossible and would overrun K storage.
+    """
+    physical_page_size = _dsv4_physical_page_size(kv_cache_spec)
+    assert raw_tensor.numel() % physical_page_size == 0
+    num_blocks = raw_tensor.numel() // physical_page_size
+    dtype = kv_cache_spec.dtype
+    shape = backend.get_kv_cache_shape(
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.head_size,
+    )
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+    page_stride = physical_page_size // dtype_size
+    tensor = raw_tensor.view(dtype)
+    strides = list(torch.empty(shape, device="meta").stride())
+    strides[0] = page_stride
+    k_cache = torch.as_strided(tensor, size=shape, stride=tuple(strides))
+
+    scale_dim = getattr(kv_cache_spec, "scale_dim", 0)
+    if not scale_dim:
+        return k_cache
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        raise NotImplementedError(
+            "DeepSeek-V4 A5 indexer full-cache layout is not supported by the v2 runner yet."
+        )
+    if getattr(kv_cache_spec, "scale_dtype", None) is None:
+        raise ValueError("DeepSeek-V4 indexer cache has scale_dim but no scale_dtype.")
+    scale_dtype = kv_cache_spec.scale_dtype
+    scale_shape = backend.get_kv_cache_shape(
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        scale_dim,
+    )
+    scale_dtype_size = torch.empty((), dtype=scale_dtype).element_size()
+    k_page_bytes = int(np.prod(shape[1:])) * dtype_size
+    assert k_page_bytes % scale_dtype_size == 0
+    scale_strides = list(torch.empty(scale_shape, device="meta").stride())
+    scale_strides[0] = physical_page_size // scale_dtype_size
+    scale_cache = torch.as_strided(
+        raw_tensor.view(scale_dtype),
+        size=scale_shape,
+        stride=tuple(scale_strides),
+        storage_offset=k_page_bytes // scale_dtype_size,
+    )
+    return k_cache, scale_cache
 
 
 def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
@@ -297,6 +463,14 @@ def _allocate_kv_cache(
         example_layer_name = kv_cache_tensor.shared_by[0]
         example_kv_cache_spec = layer_kv_cache_spec[example_layer_name]
         assert isinstance(example_kv_cache_spec, AttentionSpec)
+
+        if _is_dsv4_cache_spec(example_kv_cache_spec):
+            # DSA cache owners (compressed KV, SWA, compressor state and
+            # indexer) use their complete physical page as one tensor.
+            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_raw_tensors[layer_name] = (tensor, torch.empty(0, dtype=torch.int8, device=device))
+            continue
 
         k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_kv_cache_spec)
         assert k_dim > 0 and v_dim > 0
@@ -461,6 +635,19 @@ def _reshape_kv_cache_v2(
                 continue
 
             assert isinstance(kv_cache_spec, AttentionSpec)
+
+            if _is_dsv4_cache_spec(kv_cache_spec):
+                raw_tensor, _ = kv_cache_raw_tensors[layer_name]
+                # DSA metadata and its custom kernels use the cache spec's
+                # physical block size. This matches the V1 runner and avoids
+                # splitting indexer K/scale pages according to an unrelated
+                # hybrid-group kernel block size.
+                kv_caches[layer_name] = _view_dsv4_cache(
+                    raw_tensor,
+                    kv_cache_spec,
+                    group.backend,
+                )
+                continue
 
             raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_k_tensor is not None

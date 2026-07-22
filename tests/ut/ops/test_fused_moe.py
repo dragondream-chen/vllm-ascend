@@ -91,10 +91,13 @@ def test_unquantized_apply_builds_current_fused_experts_input(monkeypatch, moe_c
     monkeypatch.setattr(
         fused_moe_module,
         "_EXTRA_CTX",
-        SimpleNamespace(moe_comm_type=moe_comm_type, moe_comm_method=moe_comm_method),
+        SimpleNamespace(
+            input_ids=torch.tensor([7, 11]),
+            moe_comm_type=moe_comm_type,
+            moe_comm_method=moe_comm_method,
+        ),
     )
     monkeypatch.setattr(fused_moe_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 4)
-    monkeypatch.setattr(fused_moe_module, "get_forward_context", lambda: SimpleNamespace(input_ids=None))
     monkeypatch.setattr(fused_moe_module, "get_current_vllm_config", lambda: None)
     select_experts = MagicMock(return_value=(topk_weights, topk_ids))
     monkeypatch.setattr(fused_moe_module, "select_experts", select_experts)
@@ -120,6 +123,7 @@ def test_unquantized_apply_builds_current_fused_experts_input(monkeypatch, moe_c
     assert fused_input.routing.apply_router_weight_on_input
     assert fused_input.activation == "gelu"
     assert fused_input.quant.quant_type == QuantType.NONE
+    assert select_experts.call_args.kwargs["input_ids"].tolist() == [7, 11]
     if moe_comm_type == MoECommType.FUSED_MC2:
         assert fused_input.weights.w1[0] is layer.w13_weight
         assert fused_input.weights.w2[0] is layer.w2_weight

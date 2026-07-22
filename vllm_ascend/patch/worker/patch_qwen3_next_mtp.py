@@ -44,7 +44,8 @@ def bind_kv_cache(
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        layer = forward_context[layer_name]
+        layer.kv_cache = kv_cache
 
 
 utils.bind_kv_cache = bind_kv_cache

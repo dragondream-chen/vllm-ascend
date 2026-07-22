@@ -182,7 +182,7 @@ class ACLGraphWrapper:
                 from vllm.model_executor.offloader.base import get_offloader
 
                 get_offloader().sync_prev_onload()
-                forward_context.capturing = True
+                _EXTRA_CTX.capturing = True
                 try:
                     with torch.npu.graph(aclgraph, pool=self.graph_pool):
                         # `output` is managed by pytorch's aclgraph pool

@@ -363,6 +363,7 @@ class _ExtraForwardContextProxy:
         "max_tokens_across_dp",
         "max_tokens_across_pcp",
         "num_accept_tokens",
+        "input_ids",
         "in_profile_run",
         "padded_num_tokens",
         "sinks",

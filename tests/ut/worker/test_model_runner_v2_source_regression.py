@@ -40,6 +40,16 @@ def test_graph_capture_populates_ascend_moe_context_with_input_ids() -> None:
     assert "input_ids=input_ids," in source
 
 
+def test_model_pre_hook_populates_mrv2_hash_routing_context() -> None:
+    """The V2 model call itself must cover eager, warmup, and capture."""
+    source = _source_path("worker", "v2", "model_runner.py").read_text(encoding="utf-8")
+
+    assert "self.model.register_forward_pre_hook(" in source
+    assert "self._populate_ascend_moe_forward_context" in source
+    assert "_EXTRA_CTX.input_ids = input_ids" in source
+    assert "_EXTRA_CTX.moe_comm_method = get_moe_comm_method(moe_comm_type)" in source
+
+
 def test_v2_metadata_preserves_cpu_sequence_length_upper_bound() -> None:
     """Builders must receive the same upper bound as upstream MRV2."""
     model_state = _source_path("worker", "v2", "model_states", "default.py").read_text(encoding="utf-8")

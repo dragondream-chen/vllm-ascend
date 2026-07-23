@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import is_forward_context_available
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
@@ -38,6 +39,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
     MoECommType,
     get_mc2_tokens_capacity,
     override_mrv2_in_profile_run,
@@ -73,6 +75,15 @@ class NPUModelRunner(GPUModelRunner):
 
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+        # Upstream MRV2 creates the base ForwardContext immediately before it
+        # calls the model, but does not expose the current graph input IDs to
+        # Ascend's hash router. A model pre-hook covers eager, warmup, and ACL
+        # graph capture uniformly, before any MoE layer consumes the context.
+        self.model.register_forward_pre_hook(
+            self._populate_ascend_moe_forward_context,
+            with_kwargs=True,
+        )
 
         # because we will override these attribute, delete these attribute to
         # make sure it's collected by python gc immediately.
@@ -138,6 +149,36 @@ class NPUModelRunner(GPUModelRunner):
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+
+    def _populate_ascend_moe_forward_context(
+        self,
+        _module: torch.nn.Module,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        """Populate MRV2's Ascend MoE extras from the model graph inputs."""
+        if not is_forward_context_available():
+            return
+
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is None:
+            # Non-first pipeline stages use intermediate tensors and do not
+            # have token IDs available for DeepSeek-V4 hash routing.
+            return
+
+        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+
+        num_tokens = input_ids.shape[0]
+        moe_comm_type = select_moe_comm_method(num_tokens, self.vllm_config)
+        _EXTRA_CTX.input_ids = input_ids
+        _EXTRA_CTX.moe_comm_type = moe_comm_type
+        _EXTRA_CTX.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        # The current MRV2 DeepSeek-V4 graph scope deliberately excludes
+        # FlashComm-v1. Keep the context explicit rather than inheriting an
+        # unset value from the base vLLM ForwardContext.
+        _EXTRA_CTX.flash_comm_v1_enabled = False
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):

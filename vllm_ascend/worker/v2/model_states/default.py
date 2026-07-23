@@ -44,15 +44,24 @@ class AscendModelState(DefaultModelState):
     ) -> dict[str, Any]:
         """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
         if cudagraph_mode == CUDAGraphMode.FULL:
-            # Use padded sizes - padding is handled by model_runner.prepare_attn.
+            # Full graph metadata has a padded request axis, but attention
+            # builders must retain the real token count. The padded token
+            # count is passed separately as num_input_tokens so DSA can refresh
+            # every captured slot-mapping entry with PAD_SLOT_ID as needed.
             num_reqs = input_batch.num_reqs_after_padding
-            num_tokens = input_batch.num_tokens_after_padding
+            num_tokens = input_batch.num_tokens
         else:
             # For piecewise cudagraphs and eager, use unpadded sizes.
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
+        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+        max_seq_len = (
+            self.max_model_len
+            if for_capture
+            else seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        )
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.attn_metadata = build_attn_metadata(
@@ -63,21 +72,21 @@ class AscendModelState(DefaultModelState):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=input_batch.seq_lens,
-            max_seq_len=self.max_model_len,
+            max_seq_len=max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_computed_tokens_cpu=torch.from_numpy(input_batch.num_computed_tokens_np),
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             graph_pad_size=num_tokens - input_batch.num_tokens,
-            # DSA consumes positions only for real scheduled tokens. In full
-            # graph mode the remaining entries are graph padding and must not
-            # participate in compressor/indexer metadata.
-            num_input_tokens=input_batch.num_tokens,
+            # The graph replays the padded input buffer, so DSA must also
+            # refresh its persistent slot mapping for padded tokens.
+            num_input_tokens=input_batch.num_tokens_after_padding,
             num_reqs_actual=input_batch.num_reqs,
             for_cudagraph_capture=for_capture,
         )

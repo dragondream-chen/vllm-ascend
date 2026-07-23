@@ -34,7 +34,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -133,7 +133,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
-        model = ModelWithContext(model)
+        model = ModelWithContext(model, vllm_config=self.vllm_config)
         with communicator_switch():
             return super().capture(
                 model,
@@ -155,13 +155,58 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False):
+    def __init__(
+        self,
+        original_model,
+        vllm_config: VllmConfig | None = None,
+        is_draft_model: bool = False,
+        is_draft_model_prefill: bool = False,
+    ):
         super().__init__()
         self.original_model = original_model
+        self.vllm_config = vllm_config
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
 
     def forward(self, *args, **kwargs):
+        # Upstream's graph capture establishes only the base ForwardContext.
+        # DeepSeek-V4 hash routing also needs Ascend's MoE context, including
+        # the persistent graph input_ids buffer. Rebuild that context here
+        # while preserving the upstream capture metadata.
+        if self.vllm_config is not None:
+            parent_context = get_forward_context()
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None and args:
+                input_ids = args[0]
+            batch_descriptor = parent_context.batch_descriptor
+            num_tokens = (
+                batch_descriptor.num_tokens
+                if batch_descriptor is not None
+                else (input_ids.shape[0] if input_ids is not None else 0)
+            )
+            num_tokens_across_dp = (
+                parent_context.dp_metadata.num_tokens_across_dp_cpu
+                if parent_context.dp_metadata is not None
+                else None
+            )
+            with set_ascend_forward_context(
+                parent_context.attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=parent_context.cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                model_instance=self.original_model,
+                is_draft_model=self.is_draft_model,
+                skip_compiled=parent_context.skip_compiled,
+                input_ids=input_ids,
+                slot_mapping=parent_context.slot_mapping,
+                is_padding=parent_context.is_padding,
+            ):
+                return self._forward_with_context(*args, **kwargs)
+        return self._forward_with_context(*args, **kwargs)
+
+    def _forward_with_context(self, *args, **kwargs):
         # In warmup phase, capturing=False by default.
         # when capturing, we need to set capturing=True in forward context.
         if torch.npu.is_current_stream_capturing():
@@ -197,7 +242,11 @@ class ModelWithContext(nn.Module):
 def model_capture_wrapper(speculator, is_draft_model_prefill):
     """Context manager to override speculator's model for speculator capturing."""
     try:
-        speculator.model = ModelWithContext(speculator.model, True, is_draft_model_prefill)
+        speculator.model = ModelWithContext(
+            speculator.model,
+            is_draft_model=True,
+            is_draft_model_prefill=is_draft_model_prefill,
+        )
         yield
     finally:
         speculator.model = speculator.model.get_original_model()

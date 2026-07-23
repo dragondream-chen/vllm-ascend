@@ -70,6 +70,8 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    slot_mapping=None,
+    is_padding=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -83,6 +85,8 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        "slot_mapping": slot_mapping,
+        "is_padding": is_padding,
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()

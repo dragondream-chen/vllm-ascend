@@ -76,15 +76,6 @@ class NPUModelRunner(GPUModelRunner):
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
-        # Upstream MRV2 creates the base ForwardContext immediately before it
-        # calls the model, but does not expose the current graph input IDs to
-        # Ascend's hash router. A model pre-hook covers eager, warmup, and ACL
-        # graph capture uniformly, before any MoE layer consumes the context.
-        self.model.register_forward_pre_hook(
-            self._populate_ascend_moe_forward_context,
-            with_kwargs=True,
-        )
-
         # because we will override these attribute, delete these attribute to
         # make sure it's collected by python gc immediately.
         del self.req_states
@@ -149,6 +140,17 @@ class NPUModelRunner(GPUModelRunner):
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+
+    def load_model(self, *args, **kwargs) -> None:
+        """Load the model, then install MRV2's Ascend MoE context hook."""
+        super().load_model(*args, **kwargs)
+        # GPUModelRunner creates ``self.model`` in load_model(), not __init__.
+        # Install the hook afterwards so every actual model forward (eager,
+        # warmup, and ACL graph capture) receives the current input IDs.
+        self.model.register_forward_pre_hook(
+            self._populate_ascend_moe_forward_context,
+            with_kwargs=True,
+        )
 
     def _populate_ascend_moe_forward_context(
         self,

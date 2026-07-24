@@ -16,7 +16,6 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-import logging
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
@@ -91,22 +90,21 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
-        if logger.isEnabledFor(logging.DEBUG):
-            input_batch = self.model_runner.input_batch
-            assert input_batch is not None
-            input_ids = input_batch.input_ids
-            actual_tokens = input_batch.num_tokens
-            padding_end = min(input_ids.shape[0], actual_tokens + 8)
-            logger.debug(
-                "[DSV4-MRV2][graph-replay] desc=%s input_ids_ptr=%#x "
-                "actual_tokens=%d padded_tokens=%d input_ids=%s padding_ids=%s",
-                desc,
-                input_ids.data_ptr(),
-                actual_tokens,
-                input_ids.shape[0],
-                input_ids[: min(actual_tokens, 8)].cpu().tolist(),
-                input_ids[actual_tokens:padding_end].cpu().tolist(),
-            )
+        input_batch = self.model_runner.input_batch
+        assert input_batch is not None
+        input_ids = input_batch.input_ids
+        actual_tokens = input_batch.num_tokens
+        padding_end = min(input_ids.shape[0], actual_tokens + 8)
+        logger.info(
+            "[DSV4-MRV2][graph-replay] desc=%s input_ids_ptr=%#x "
+            "actual_tokens=%d padded_tokens=%d input_ids=%s padding_ids=%s",
+            desc,
+            input_ids.data_ptr(),
+            actual_tokens,
+            input_ids.shape[0],
+            input_ids[: min(actual_tokens, 8)].cpu().tolist(),
+            input_ids[actual_tokens:padding_end].cpu().tolist(),
+        )
         ret = super().run_fullgraph(desc)
 
         positions = self.model_runner.input_buffers.positions[:num_tokens]

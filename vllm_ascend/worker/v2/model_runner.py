@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import logging
 from contextlib import contextmanager
 
 import numpy as np
@@ -24,6 +25,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import is_forward_context_available
+from vllm.logger import logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
@@ -181,6 +183,20 @@ class NPUModelRunner(GPUModelRunner):
         # FlashComm-v1. Keep the context explicit rather than inheriting an
         # unset value from the base vLLM ForwardContext.
         _EXTRA_CTX.flash_comm_v1_enabled = False
+
+        if logger.isEnabledFor(logging.DEBUG):
+            token_sample = input_ids[: min(input_ids.shape[0], 8)].cpu().tolist()
+            logger.debug(
+                "[DSV4-MRV2][hash-routing-bind] capturing=%s input_ids_ptr=%#x "
+                "shape=%s dtype=%s num_tokens=%d moe_comm_type=%s tokens=%s",
+                torch.npu.is_current_stream_capturing(),
+                input_ids.data_ptr(),
+                tuple(input_ids.shape),
+                input_ids.dtype,
+                num_tokens,
+                moe_comm_type,
+                token_sample,
+            )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
@@ -364,6 +380,27 @@ class NPUModelRunner(GPUModelRunner):
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            sample_end = min(num_tokens, 8)
+            padding_end = min(num_tokens_after_padding, num_tokens + 8)
+            logger.debug(
+                "[DSV4-MRV2][graph-input] cg_mode=%s actual_tokens=%d "
+                "padded_tokens=%d actual_reqs=%d padded_reqs=%d input_ids_ptr=%#x "
+                "input_ids=%s padding_ids=%s positions=%s query_start_loc=%s "
+                "seq_lens_cpu_upper_bound=%s",
+                batch_desc.cg_mode,
+                num_tokens,
+                num_tokens_after_padding,
+                num_reqs,
+                num_reqs_padded,
+                input_ids.data_ptr(),
+                input_ids[:sample_end].cpu().tolist(),
+                input_ids[num_tokens:padding_end].cpu().tolist(),
+                positions[:sample_end].cpu().tolist(),
+                query_start_loc_np.tolist(),
+                seq_lens_cpu_upper_bound_np.tolist(),
+            )
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
         max_seq_len_np = None
         if getattr(self, "use_pp", False):

@@ -52,6 +52,18 @@ def test_model_pre_hook_populates_mrv2_hash_routing_context() -> None:
     assert "self._populate_ascend_moe_forward_context" in source
     assert "_EXTRA_CTX.input_ids = input_ids" in source
     assert "_EXTRA_CTX.moe_comm_method = get_moe_comm_method(moe_comm_type)" in source
+    assert "[DSV4-MRV2][hash-routing-bind]" in source
+
+
+def test_dsv4_graph_diagnostics_cover_inputs_and_dsa_metadata() -> None:
+    """Debug logging must expose the graph-buffer and DSA metadata contract."""
+    model_runner = _source_path("worker", "v2", "model_runner.py").read_text(encoding="utf-8")
+    attn_utils = _source_path("worker", "v2", "attn_utils.py").read_text(encoding="utf-8")
+    aclgraph_utils = _source_path("worker", "v2", "aclgraph_utils.py").read_text(encoding="utf-8")
+
+    assert "[DSV4-MRV2][graph-input]" in model_runner
+    assert "[DSV4-MRV2][dsa-metadata]" in attn_utils
+    assert "[DSV4-MRV2][graph-replay]" in aclgraph_utils
 
 
 def test_v2_metadata_preserves_cpu_sequence_length_upper_bound() -> None:

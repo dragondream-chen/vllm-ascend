@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -29,6 +30,7 @@ from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vll
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -251,13 +253,32 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
-                if is_dsa_builder:
-                    attn_metadata_extra_kwargs.update(
-                        num_reqs_actual=num_reqs if num_reqs_actual is None else num_reqs_actual,
-                        prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
-                        decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
-                        common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
-                        block_size=attn_group.kv_cache_spec.block_size,
+            if is_dsa_builder:
+                attn_metadata_extra_kwargs.update(
+                    num_reqs_actual=num_reqs if num_reqs_actual is None else num_reqs_actual,
+                    prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
+                    decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
+                    common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                    block_size=attn_group.kv_cache_spec.block_size,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    sample_end = min(num_tokens, 8)
+                    padding_end = min(num_input_tokens, num_tokens + 8)
+                    logger.debug(
+                        "[DSV4-MRV2][dsa-metadata] group=%d actual_tokens=%d "
+                        "input_tokens=%d actual_reqs=%s metadata_reqs=%d "
+                        "query_start_loc=%s seq_lens=%s slot_mapping_ptr=%#x "
+                        "slot_mapping=%s padding_slot_mapping=%s",
+                        i,
+                        num_tokens,
+                        num_input_tokens,
+                        num_reqs_actual,
+                        num_reqs,
+                        query_start_loc_cpu[: num_reqs + 1].tolist(),
+                        seq_lens_cpu[:num_reqs].tolist(),
+                        slot_mapping.data_ptr(),
+                        slot_mapping[:sample_end].cpu().tolist(),
+                        slot_mapping[num_tokens:padding_end].cpu().tolist(),
                     )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,

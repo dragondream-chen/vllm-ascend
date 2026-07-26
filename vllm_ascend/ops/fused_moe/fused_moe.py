@@ -89,6 +89,8 @@ def mock_true():
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+    supports_input_ids = True
+
     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
         super().__init__(moe=moe)
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
@@ -155,10 +157,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         global_redundant_expert_num: int = 0,
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
-        input_ids = _EXTRA_CTX.input_ids
+        input_ids = input_ids if input_ids is not None else _EXTRA_CTX.input_ids
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
         if num_shared_experts is None:
             num_shared_experts = 0
@@ -532,7 +535,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.routed_experts._ascend_moe_lora_context = lora_context
 
     def no_shared_forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        return_with_event: bool = False,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | FusedMoEResult:
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
@@ -563,7 +570,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # apply() expects a RoutedExperts-like layer for weight access
         # (w13_weight, w2_weight, swiglu_limit, etc.). Pass routed_experts,
         # not self; the routing params come through the other kwargs.
-        fused_experts_results: FusedExpertsResult = self._quant_method.apply(
+        quant_kwargs = dict(
             layer=self.routed_experts,
             x=hidden_states,
             router_logits=router_logits,
@@ -586,6 +593,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
         )
+        if getattr(self._quant_method, "supports_input_ids", False):
+            quant_kwargs["input_ids"] = input_ids
+        fused_experts_results: FusedExpertsResult = self._quant_method.apply(**quant_kwargs)
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens
@@ -734,7 +744,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         return shared_out
 
     def shared_forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ):
         if self.is_internal_router:
             gate = self.gate
@@ -755,6 +768,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             hidden_states,
             router_logits,
             return_with_event=True,
+            input_ids=input_ids,
         )
         routed_out = fused_moe_results.routed_out
 
@@ -783,6 +797,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         with self._sequence_parallel_context():
             if self.shared_experts is None:
-                return self.no_shared_forward_impl(hidden_states, router_logits)
+                return self.no_shared_forward_impl(hidden_states, router_logits, input_ids=input_ids)
             else:
-                return self.shared_forward_impl(hidden_states, router_logits)
+                return self.shared_forward_impl(hidden_states, router_logits, input_ids=input_ids)

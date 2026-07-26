@@ -296,8 +296,11 @@ class NPUModelRunner(GPUModelRunner):
         if self.is_dsv4_dsa:
             # A preceding DSA graph capture fills dummy positions with 127.
             # Real requests overwrite their own rows above, so explicitly
-            # clear only the graph-padding tail before replay.
+            # clear only the graph-padding tail before replay. Hash-based MoE
+            # routing also consumes input_ids during replay, so clear its
+            # padding tail to a deterministic valid vocabulary id.
             self.input_buffers.positions[num_tokens:num_tokens_after_padding].zero_()
+            self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].zero_()
 
         # CPU lengths are consumed by DSA metadata too. Clear every unused
         # row, including a possible FIA dummy request between real and padded

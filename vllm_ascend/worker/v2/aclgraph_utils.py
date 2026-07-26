@@ -34,7 +34,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.attn_utils import is_dsv4_dsa_config
 from vllm_ascend.worker.v2.input_batch import dsv4_capture_dummy_positions
@@ -92,7 +92,29 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
-        ret = super().run_fullgraph(desc)
+
+        # Full-graph replay enters the captured FX graph directly, bypassing
+        # DeepSeekV4ForCausalLM.forward().  The normal eager path sets this
+        # value there, but hash-based DSV4 MoE routing reads it from the
+        # Ascend forward context while replaying.  Keep the static graph input
+        # view alive in that context for the entire replay.
+        if is_dsv4_dsa_config(self.vllm_config):
+            input_ids = self.model_runner.input_buffers.input_ids[:num_tokens]
+            num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens)
+            with set_ascend_forward_context(
+                self.model_runner.model_state.attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=desc.cg_mode,
+                batch_descriptor=None,
+                slot_mapping=None,
+                input_ids=input_ids,
+                is_padding=self.model_runner.input_buffers.is_padding[:num_tokens],
+            ):
+                ret = super().run_fullgraph(desc)
+        else:
+            ret = super().run_fullgraph(desc)
 
         positions = self.model_runner.input_buffers.positions[:num_tokens]
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to

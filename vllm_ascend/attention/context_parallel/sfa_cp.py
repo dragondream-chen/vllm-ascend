@@ -6,12 +6,12 @@ import torch.distributed as dist
 import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
-from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
@@ -349,10 +349,9 @@ class AscendSFACPImpl(AscendSFAImpl):
         # In graph mode, output buffer uses graph bucket token size
         # (forward_context.num_tokens), while PCP path may compute only valid
         # tokens. Align to the larger one to avoid later write-back mismatch.
-        forward_context = get_forward_context()
         target_tokens = max(
             attn_metadata.num_input_tokens,
-            forward_context.num_tokens if forward_context is not None else 0,
+            _EXTRA_CTX.num_tokens or 0,
         )
 
         if attn_output.shape[0] == target_tokens:

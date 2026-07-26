@@ -5,7 +5,6 @@ from enum import Enum
 from typing import Any
 
 import torch
-import vllm.envs as envs_vllm
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
@@ -95,7 +94,7 @@ def set_ascend_forward_context(
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
-        forward_context.input_ids = input_ids
+        _EXTRA_CTX.input_ids = input_ids
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -371,6 +370,7 @@ class _ExtraForwardContextProxy:
         "max_tokens_across_dp",
         "max_tokens_across_pcp",
         "num_accept_tokens",
+        "input_ids",
         "in_profile_run",
         "padded_num_tokens",
         "sinks",
@@ -390,20 +390,14 @@ class _ExtraForwardContextProxy:
 
     def __getattr__(self, name: str) -> Any:
         self.check_extra_attr(name)
-        ctx = self._ctx()
-        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            # Unset known extras default to None so optional flags (e.g. `sinks`)
-            # can be read with truthiness checks before the V2 path populates them.
-            return ctx.additional_kwargs.get(name)
-        return getattr(ctx, name, None)
+        # Ascend extension fields use one canonical storage location in both
+        # model runners. Standard vLLM fields remain direct ForwardContext
+        # attributes and must not be accessed through this proxy.
+        return self._ctx().additional_kwargs.get(name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         self.check_extra_attr(name)
-        ctx = self._ctx()
-        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            ctx.additional_kwargs[name] = value
-        else:
-            setattr(ctx, name, value)
+        self._ctx().additional_kwargs[name] = value
 
 
 # usage: from vllm_ascend.ascend_forward_context import _EXTRA_CTX

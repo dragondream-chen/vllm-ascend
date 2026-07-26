@@ -172,6 +172,7 @@ from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPMan
 from vllm_ascend.worker.utils import AscendKVBlockZeroer, copy_snapshot_to_gpu
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
+    _EXTRA_CTX,
     MoECommType,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
@@ -2845,7 +2846,7 @@ class NPUModelRunner(GPUModelRunner):
     @staticmethod
     def _all_gather_hidden_states(hidden_states):
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        pad_size = get_forward_context().pad_size
+        pad_size = _EXTRA_CTX.pad_size or 0
         if pad_size > 0:
             hidden_states = hidden_states[:-pad_size, :]
 
@@ -2874,7 +2875,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
+            and not _EXTRA_CTX.capturing
             and not self.use_sparse and not self.use_compress
         ):
             if self.enable_enpu:
@@ -2925,7 +2926,7 @@ class NPUModelRunner(GPUModelRunner):
                 forward_context, num_tokens_padded, positions
             )
 
-        if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+        if _EXTRA_CTX.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 

@@ -56,6 +56,57 @@ from vllm_ascend.utils import AscendDeviceType, calc_split_factor, get_ascend_de
 _ATTENTION_MASK_BUILDER = None
 
 
+def _is_dsv4_cache_layer(layer: Attention) -> bool:
+    """Whether ``layer`` owns a DeepSeek-V4 DSA cache."""
+    layer_cls = type(layer)
+    return (
+        layer_cls.__module__ == "vllm_ascend.models.layer.attention.layer"
+        and layer_cls.__name__ == "DSAAttention"
+    ) or layer_cls.__module__ == "vllm_ascend.models.deepseek_v4"
+
+
+def bind_kv_cache(
+    kv_caches: dict[str, Any],
+    forward_context: dict[str, Attention],
+    runner_kv_caches: list[Any],
+    num_attn_module: int = 1,
+) -> None:
+    """Bind MRV2 KV caches, preserving MRV1's DeepSeek-V4 DSA ABI.
+
+    Upstream's helper rejects the NPU case where a decoder layer owns several
+    DSA cache tensors. DSA also requires every cache owner to retain a
+    single-element virtual-engine list, unlike ordinary MRV2 attention.
+    """
+    assert len(runner_kv_caches) == 0
+
+    dsv4_layer_names = [
+        layer_name for layer_name in kv_caches if _is_dsv4_cache_layer(forward_context[layer_name])
+    ]
+    if dsv4_layer_names and len(dsv4_layer_names) == len(kv_caches):
+        # Keep exactly the MRV1 DeepSeek-V4 cache order. MTP layers follow
+        # the main model layers, then cache-owner names make the order stable
+        # within a transformer layer.
+        for layer_name in sorted(
+            dsv4_layer_names,
+            key=lambda name: (".mtp." in f".{name}.", extract_layer_index(name), name),
+        ):
+            runner_kv_caches.append(kv_caches[layer_name])
+        for layer_name, kv_cache in kv_caches.items():
+            forward_context[layer_name].kv_cache = [kv_cache]
+        return
+
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+    for layer_index in sorted(index2name):
+        for layer_name in index2name[layer_index]:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        layer = forward_context[layer_name]
+        layer.kv_cache = [kv_cache] if _is_dsv4_cache_layer(layer) else kv_cache
+
+
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
     kv_cache_spec: dict[str, KVCacheSpec] = {}

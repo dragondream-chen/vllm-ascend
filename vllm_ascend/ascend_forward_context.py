@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import vllm.envs as envs_vllm
+from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
@@ -69,7 +70,10 @@ def set_ascend_forward_context(
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
+    ubatch_slices: UBatchSlices | None = None,
+    slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     eplb_heat_collection_status: bool = False,
+    is_padding: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -83,6 +87,9 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        "ubatch_slices": ubatch_slices,
+        "slot_mapping": slot_mapping,
+        "is_padding": is_padding,
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
@@ -95,19 +102,19 @@ def set_ascend_forward_context(
         max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
         moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model)
 
-        forward_context.moe_comm_type = moe_comm_type
-        forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        _EXTRA_CTX.moe_comm_type = moe_comm_type
+        _EXTRA_CTX.moe_comm_method = get_moe_comm_method(moe_comm_type)
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
-        forward_context.in_profile_run = in_profile_run
+        _EXTRA_CTX.in_profile_run = in_profile_run
 
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
-        forward_context.capturing = False
+        _EXTRA_CTX.capturing = False
 
         # TODO: remove it when fia merge in fiav2
-        forward_context.sinks = has_sinks
+        _EXTRA_CTX.sinks = has_sinks
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
@@ -130,29 +137,29 @@ def set_ascend_forward_context(
             flash_comm_v1_enabled = False
         else:
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
-        forward_context.mmrs_fusion = mmrs_fusion
-        forward_context.num_tokens = num_tokens
-        forward_context.flash_comm_v1_enabled = flash_comm_v1_enabled
+        _EXTRA_CTX.mmrs_fusion = mmrs_fusion
+        _EXTRA_CTX.num_tokens = num_tokens
+        _EXTRA_CTX.flash_comm_v1_enabled = flash_comm_v1_enabled
 
-        forward_context.pad_size = 0
-        if forward_context.flash_comm_v1_enabled:
+        _EXTRA_CTX.pad_size = 0
+        if flash_comm_v1_enabled:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
-            forward_context.pad_size = pad_size
+            _EXTRA_CTX.pad_size = pad_size
 
         # set this for rope forward_oot using
         forward_context.is_first_layer = True
 
         # set layer_idx to enable optimization features that depend on this information.
         # This is only applicable to models that contain these necessary attributes.
-        forward_context.layer_idx = None
+        _EXTRA_CTX.layer_idx = None
         if has_layer_idx(model_instance):
-            forward_context.layer_idx = model_instance.model.start_layer
+            _EXTRA_CTX.layer_idx = model_instance.model.start_layer
 
-        forward_context.prefetch_mlp_gate_up_proj = False
-        forward_context.prefetch_mlp_down_proj = False
-        forward_context.model_instance = model_instance
-        forward_context.is_draft_model = is_draft_model
-        forward_context.is_draft_model_prefill = False
+        _EXTRA_CTX.prefetch_mlp_gate_up_proj = False
+        _EXTRA_CTX.prefetch_mlp_down_proj = False
+        _EXTRA_CTX.model_instance = model_instance
+        _EXTRA_CTX.is_draft_model = is_draft_model
+        _EXTRA_CTX.is_draft_model_prefill = False
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
@@ -161,30 +168,31 @@ def set_ascend_forward_context(
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
-            if forward_context.flash_comm_v1_enabled:
+            if flash_comm_v1_enabled:
                 padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens
-                forward_context.padded_length = padded_length
-                forward_context.pad_size = pad_size
+                _EXTRA_CTX.padded_length = padded_length
+                _EXTRA_CTX.pad_size = pad_size
         else:
             max_tokens_across_dp = num_tokens
 
-        forward_context.max_tokens_across_dp = max_tokens_across_dp
-        forward_context.max_tokens_across_pcp = max_tokens_across_pcp
+        _EXTRA_CTX.max_tokens_across_dp = max_tokens_across_dp
+        _EXTRA_CTX.max_tokens_across_pcp = max_tokens_across_pcp
 
-        forward_context.eplb_heat_collection_status = eplb_heat_collection_status
+        _EXTRA_CTX.eplb_heat_collection_status = eplb_heat_collection_status
 
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
-            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            _EXTRA_CTX.padded_num_tokens = padded_num_tokens
             reserved_mc2_mask = get_mc2_mask()
             if reserved_mc2_mask is not None:
-                mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
+                mc2_mask = reserved_mc2_mask[:padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
-                forward_context.mc2_mask = mc2_mask
+                _EXTRA_CTX.mc2_mask = mc2_mask
         try:
             yield
         finally:

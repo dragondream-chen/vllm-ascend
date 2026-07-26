@@ -31,6 +31,12 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
+# Full NPU graph replay can enter a generated FX function that installs a
+# fresh vLLM ForwardContext. That context does not carry the input_ids added by
+# the model's eager forward. Keep the graph's static input buffer separately
+# for the duration of one MRV2 replay so DSV4 hash routing can retrieve it.
+_MRV2_GRAPH_INPUT_IDS: torch.Tensor | None = None
+
 
 @contextmanager
 def override_mrv2_in_profile_run(enabled: bool):
@@ -50,6 +56,22 @@ def override_mrv2_in_profile_run(enabled: bool):
 
 def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
+
+
+@contextmanager
+def mrv2_graph_input_ids(input_ids: torch.Tensor):
+    """Expose MRV2's static input buffer to generated full-graph FX code."""
+    global _MRV2_GRAPH_INPUT_IDS
+    previous_input_ids = _MRV2_GRAPH_INPUT_IDS
+    _MRV2_GRAPH_INPUT_IDS = input_ids
+    try:
+        yield
+    finally:
+        _MRV2_GRAPH_INPUT_IDS = previous_input_ids
+
+
+def get_mrv2_graph_input_ids() -> torch.Tensor | None:
+    return _MRV2_GRAPH_INPUT_IDS
 
 
 @contextmanager

@@ -19,7 +19,11 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 from vllm.distributed import get_tp_group
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    MoECommType,
+    get_mrv2_graph_input_ids,
+)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 
@@ -245,6 +249,12 @@ def _select_experts_with_fusion_ops(
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
             input_ids = input_ids if input_ids is not None else _EXTRA_CTX.input_ids
+            if input_ids is None:
+                # During MRV2 full-graph replay, torch-npu may execute a
+                # generated FX function with a fresh ForwardContext. Its
+                # static input buffer is exposed separately by the graph
+                # manager for exactly this fallback path.
+                input_ids = get_mrv2_graph_input_ids()
             if input_ids is None:
                 raise RuntimeError("DeepSeek V4 hash routing requires input_ids in the Ascend forward context.")
             input_ids = input_ids.to(torch.int64)

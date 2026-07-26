@@ -34,7 +34,11 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    mrv2_graph_input_ids,
+    set_ascend_forward_context,
+)
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.attn_utils import is_dsv4_dsa_config
 from vllm_ascend.worker.v2.input_batch import dsv4_capture_dummy_positions
@@ -101,16 +105,19 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if is_dsv4_dsa_config(self.vllm_config):
             input_ids = self.model_runner.input_buffers.input_ids[:num_tokens]
             num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens)
-            with set_ascend_forward_context(
-                self.model_runner.model_state.attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=desc.cg_mode,
-                batch_descriptor=None,
-                slot_mapping=None,
-                input_ids=input_ids,
-                is_padding=self.model_runner.input_buffers.is_padding[:num_tokens],
+            with (
+                mrv2_graph_input_ids(input_ids),
+                set_ascend_forward_context(
+                    self.model_runner.model_state.attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=desc.cg_mode,
+                    batch_descriptor=None,
+                    slot_mapping=None,
+                    input_ids=input_ids,
+                    is_padding=self.model_runner.input_buffers.is_padding[:num_tokens],
+                ),
             ):
                 ret = super().run_fullgraph(desc)
         else:

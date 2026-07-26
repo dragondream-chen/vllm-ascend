@@ -2,7 +2,7 @@ import torch
 import vllm.v1.worker.utils as utils
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
-
+from vllm.config import get_current_vllm_config
 
 # Without this patch, it will raise an exception when initialize kv_cache.
 # TODO To remove the patch, we need check why the original bind_kv_cache raises an NotImplementedError.
@@ -30,6 +30,22 @@ def bind_kv_cache(
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
+
+    vllm_config = get_current_vllm_config()
+    model_config = getattr(vllm_config, "model_config", None)
+
+    if model_config.hf_text_config.model_type == "deepseek_v4":
+        from vllm_ascend.utils import extract_dsv4_layer_index
+
+        assert len(runner_kv_caches) == 0
+        for layer_name in sorted(
+                kv_caches,
+                key=lambda name: (extract_dsv4_layer_index(
+                    model_config.hf_text_config, name), name)):
+            runner_kv_caches.append(kv_caches[layer_name])
+        for layer_name, kv_cache in kv_caches.items():
+            forward_context[layer_name].kv_cache = [kv_cache]
+        return
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)

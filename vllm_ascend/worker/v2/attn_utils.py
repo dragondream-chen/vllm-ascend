@@ -20,6 +20,7 @@
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -54,6 +55,26 @@ from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import AscendDeviceType, calc_split_factor, get_ascend_device_type
 
 _ATTENTION_MASK_BUILDER = None
+
+
+def is_dsv4_dsa_config(vllm_config: VllmConfig) -> bool:
+    """Whether the current model uses DeepSeek-V4 DSA cache semantics.
+
+    ``compress_ratios`` alone is intentionally not used as the public
+    predicate: this path owns DSA-specific graph padding and RoPE behaviour,
+    not a generic compression feature.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", hf_config)
+    return (
+        hf_config is not None
+        and getattr(hf_text_config, "model_type", None) == "deepseek_v4"
+        and (
+            hasattr(hf_config, "compress_ratios")
+            or hasattr(hf_text_config, "compress_ratios")
+        )
+    )
 
 
 def _is_dsv4_cache_layer(layer: Attention) -> bool:
@@ -187,6 +208,8 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
     num_reqs_actual: int | None = None,
+    dsa_num_actual_tokens: int | None = None,
+    dsa_num_input_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -243,8 +266,18 @@ def build_attn_metadata(
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
+            builder_common_attn_metadata = common_attn_metadata
+            if is_dsa_builder:
+                # In a FULL graph, DSA must distinguish the tokens which can
+                # update its caches from graph-only padding.  Its common RoPE
+                # inputs still cover the entire captured graph shape.
+                builder_common_attn_metadata = copy(common_attn_metadata)
+                if dsa_num_actual_tokens is not None:
+                    builder_common_attn_metadata.num_actual_tokens = dsa_num_actual_tokens
+                if dsa_num_input_tokens is not None:
+                    builder_common_attn_metadata.num_input_tokens = dsa_num_input_tokens
             if for_cudagraph_capture and not is_dsa_builder:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
+                metadata = attn_metadata_builder.build_for_cudagraph_capture(builder_common_attn_metadata)
             else:
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
@@ -264,7 +297,7 @@ def build_attn_metadata(
                     )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
+                    common_attn_metadata=builder_common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
                 if is_dsa_builder:

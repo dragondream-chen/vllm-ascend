@@ -16,6 +16,8 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -26,6 +28,21 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+
+
+_USE_DSV4_CAPTURE_DUMMY_POSITIONS: ContextVar[bool] = ContextVar(
+    "use_dsv4_capture_dummy_positions", default=False
+)
+
+
+@contextmanager
+def dsv4_capture_dummy_positions():
+    """Use the V1 DSA dummy RoPE position only while recording graphs."""
+    token = _USE_DSV4_CAPTURE_DUMMY_POSITIONS.set(True)
+    try:
+        yield
+    finally:
+        _USE_DSV4_CAPTURE_DUMMY_POSITIONS.reset(token)
 
 
 class AscendInputBuffers(InputBuffers):
@@ -87,6 +104,10 @@ class AscendInputBatch(InputBatch):
             num_tokens,
             input_buffers,
         )
+        if _USE_DSV4_CAPTURE_DUMMY_POSITIONS.get():
+            # 127 exercises the c128 compressor boundary during graph capture.
+            # Do not use it for profiling/DP dummy runs.
+            input_buffers.positions[:num_tokens].fill_(127)
         # seq_len equals to query_len
         input_buffers.seq_lens_np[:num_reqs] = num_tokens // num_reqs
         input_buffers.seq_lens_np[num_reqs - 1] += num_tokens % num_reqs

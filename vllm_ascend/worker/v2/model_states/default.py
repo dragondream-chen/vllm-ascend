@@ -74,11 +74,14 @@ class AscendModelState(DefaultModelState):
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             graph_pad_size=num_tokens - input_batch.num_tokens,
-            # DSA consumes positions only for real scheduled tokens. In full
-            # graph mode the remaining entries are graph padding and must not
-            # participate in compressor/indexer metadata.
+            # Keep the generic backend's existing input-token semantics. DSA
+            # receives its own actual-vs-padded values below.
             num_input_tokens=input_batch.num_tokens,
             num_reqs_actual=input_batch.num_reqs,
+            # A DSA graph needs RoPE inputs for every captured row, while its
+            # compressor/indexer must only see real scheduled tokens.
+            dsa_num_actual_tokens=input_batch.num_tokens,
+            dsa_num_input_tokens=input_batch.num_tokens_after_padding,
             for_cudagraph_capture=for_capture,
         )
         return self.attn_metadata

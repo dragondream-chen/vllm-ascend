@@ -17,7 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -36,6 +36,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
+from vllm_ascend.worker.v2.attn_utils import is_dsv4_dsa_config
+from vllm_ascend.worker.v2.input_batch import dsv4_capture_dummy_positions
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -134,20 +136,30 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         model = ModelWithContext(model)
-        with communicator_switch():
-            return super().capture(
-                model,
-                model_state,
-                input_buffers,
-                intermediate_tensors,
-                block_tables,
-                attn_groups,
-                kv_cache_config,
-                has_lora=has_lora,
-                use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
-                lora_capture_hook=lora_capture_hook,
-                progress_bar_desc=progress_bar_desc,
-            )
+        is_dsv4_dsa = is_dsv4_dsa_config(self.vllm_config)
+        try:
+            with communicator_switch(), (
+                dsv4_capture_dummy_positions() if is_dsv4_dsa else nullcontext()
+            ):
+                return super().capture(
+                    model,
+                    model_state,
+                    input_buffers,
+                    intermediate_tensors,
+                    block_tables,
+                    attn_groups,
+                    kv_cache_config,
+                    has_lora=has_lora,
+                    use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
+                    lora_capture_hook=lora_capture_hook,
+                    progress_bar_desc=progress_bar_desc,
+                )
+        finally:
+            if is_dsv4_dsa:
+                # Graph replay observes this static input buffer by address.
+                # Reset it only after recording has completed; runtime input
+                # preparation then fills real positions and zeroes padding.
+                input_buffers.positions.zero_()
 
 
 class ModelWithContext(nn.Module):

@@ -48,7 +48,7 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
-from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.attn_utils import build_attn_state, is_dsv4_dsa_config
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
@@ -139,6 +139,7 @@ class NPUModelRunner(GPUModelRunner):
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+        self.is_dsv4_dsa = is_dsv4_dsa_config(vllm_config)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
@@ -263,7 +264,9 @@ class NPUModelRunner(GPUModelRunner):
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
 
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
-        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+        # Input preparation only touches real requests. The InputBatch itself
+        # must retain the padded view for FULL graph DSA metadata.
+        query_start_loc_actual = self.input_buffers.query_start_loc[: num_reqs + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
         num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
@@ -274,7 +277,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
                 idx_mapping,
-                query_start_loc,
+                query_start_loc_actual,
                 self.req_states.all_token_ids.gpu,
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
@@ -283,15 +286,23 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare positions and seq_lens.
         prepare_pos_seq_lens(
             idx_mapping,
-            query_start_loc,
+            query_start_loc_actual,
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs]
 
-        # Pad for full CUDA graph mode.
-        self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
+        if self.is_dsv4_dsa:
+            # A preceding DSA graph capture fills dummy positions with 127.
+            # Real requests overwrite their own rows above, so explicitly
+            # clear only the graph-padding tail before replay.
+            self.input_buffers.positions[num_tokens:num_tokens_after_padding].zero_()
+
+        # CPU lengths are consumed by DSA metadata too. Clear every unused
+        # row, including a possible FIA dummy request between real and padded
+        # request counts.
+        self.input_buffers.seq_lens_np[num_reqs:] = 0
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
@@ -299,7 +310,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_buffers.input_ids,
             idx_mapping,
             self.req_states.last_sampled_tokens,
-            query_start_loc,
+            query_start_loc_actual,
             seq_lens,
             self.req_states.prefill_len.gpu,
             self.req_states.draft_tokens,
@@ -309,6 +320,7 @@ class NPUModelRunner(GPUModelRunner):
 
         input_ids = self.input_buffers.input_ids[:num_tokens_after_padding]
         positions = self.input_buffers.positions[:num_tokens_after_padding]
+        query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.

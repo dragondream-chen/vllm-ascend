@@ -52,6 +52,7 @@ from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.spec_decode.utils import (
     update_num_computed_tokens_for_batch_change,
 )
@@ -690,7 +691,7 @@ class NPUModelRunner310(NPUModelRunner):
             self.speculative_config is not None
             and not self.enable_enpu
             and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
+            and not _EXTRA_CTX.capturing
             and hasattr(self, "update_stream")
         )
 
@@ -713,7 +714,7 @@ class NPUModelRunner310(NPUModelRunner):
                 positions,
             )
 
-        if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+        if _EXTRA_CTX.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 

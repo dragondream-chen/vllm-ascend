@@ -16,10 +16,52 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from collections.abc import Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
 from vllm.v1.worker.gpu.block_table import BlockTables, _load_ptr
+from vllm.utils.math_utils import cdiv
+
+
+# GPUModelRunner.initialize_kv_cache() only passes scalar block-table
+# dimensions to BlockTables. DeepSeek-V4 needs the original group specs as
+# well: compressed cache groups have a smaller logical block-table capacity.
+# Keep this scoped to initialization so the upstream runner control flow does
+# not need to be copied into vllm-ascend.
+_KV_CACHE_GROUPS_FOR_BLOCK_TABLE: ContextVar[
+    tuple[KVCacheGroupSpec, ...] | None
+] = ContextVar("kv_cache_groups_for_ascend_block_table", default=None)
+
+
+@contextmanager
+def block_table_kv_cache_groups_context(kv_cache_groups: Sequence[KVCacheGroupSpec]):
+    token = _KV_CACHE_GROUPS_FOR_BLOCK_TABLE.set(tuple(kv_cache_groups))
+    try:
+        yield
+    finally:
+        _KV_CACHE_GROUPS_FOR_BLOCK_TABLE.reset(token)
+
+
+def _get_compress_ratio(kv_cache_group: KVCacheGroupSpec) -> int:
+    """Get the one compression ratio represented by a KV-cache group."""
+    spec = kv_cache_group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        ratios = {
+            max(int(getattr(item, "compress_ratio", 1) or 1), 1)
+            for item in spec.kv_cache_specs.values()
+        }
+        if len(ratios) != 1:
+            raise ValueError(
+                "A KV cache group must have one compress_ratio for block-table "
+                f"addressing, got {sorted(ratios)}."
+            )
+        return ratios.pop()
+    return max(int(getattr(spec, "compress_ratio", 1) or 1), 1)
 
 
 class AscendBlockTables(BlockTables):
@@ -39,6 +81,28 @@ class AscendBlockTables(BlockTables):
     ):
         if kernel_block_sizes is None:
             kernel_block_sizes = block_sizes
+
+        kv_cache_groups = _KV_CACHE_GROUPS_FOR_BLOCK_TABLE.get()
+        if kv_cache_groups is None:
+            # Non-DSA callers keep the upstream behavior. The V2 patch is
+            # process-wide, so this fallback is needed for other models.
+            compress_ratios = [1] * len(block_sizes)
+        else:
+            if len(kv_cache_groups) != len(block_sizes):
+                raise ValueError(
+                    "KV cache group count must match block-table group count: "
+                    f"{len(kv_cache_groups)} != {len(block_sizes)}"
+                )
+            compress_ratios = [_get_compress_ratio(group) for group in kv_cache_groups]
+
+        # Mirror MRv1 BlockTable: the scheduler's DCP/alignment-adjusted
+        # capacity is converted to the compressed cache's logical capacity
+        # before BlockTables expands physical blocks into kernel blocks.
+        max_num_blocks_per_group = [
+            max(cdiv(num_blocks, ratio), 1)
+            for num_blocks, ratio in zip(max_num_blocks_per_group, compress_ratios)
+        ]
+
         super().__init__(
             block_sizes,
             max_num_reqs,
@@ -61,6 +125,15 @@ class AscendBlockTables(BlockTables):
             dtype=torch.int32,
             device=self.device,
         )
+        self.compress_ratios = compress_ratios
+        # The DSA compressor custom op owns c4/c128 compressed slot mapping.
+        # Generic V2 slot mapping must not index those shortened block tables
+        # with raw token positions.
+        self.generic_slot_mapping_mask = torch.tensor(
+            [ratio == 1 for ratio in compress_ratios],
+            dtype=torch.bool,
+            device=self.device,
+        )
 
     def compute_slot_mappings(
         self,
@@ -79,6 +152,7 @@ class AscendBlockTables(BlockTables):
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
+            self.generic_slot_mapping_mask,
             self.slot_mappings,
             self.slot_mappings.stride(0),
             self.cp_rank,
@@ -86,7 +160,6 @@ class AscendBlockTables(BlockTables):
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
-            TOTAL_BLOCK_SIZE=4096,
         )
         return self.slot_mappings[:, :num_tokens_padded]
 
@@ -100,6 +173,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
+    generic_slot_mapping_mask,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -107,7 +181,6 @@ def _compute_slot_mappings_kernel(
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
-    TOTAL_BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
     group_id = tl.program_id(0)
@@ -124,6 +197,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
+    use_generic_slot_mapping = tl.load(generic_slot_mapping_mask + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -142,12 +216,21 @@ def _compute_slot_mappings_kernel(
         # replace the % operation with sub and mul instead
         block_offsets = positions - (block_size * CP_SIZE) * block_indices
 
-        # The 'block_indics' variable results in non-contiguous memory assess,
-        # which triggers degradation toscalar computation.
-        # Mitigate this by loading the complete data block and extracting the required data with tl.gather
-        block_numbers = tl.load(block_table_ptr + req_state_idx * block_table_stride + tl.arange(0, TOTAL_BLOCK_SIZE))
-        block_numbers = block_numbers.to(tl.float32)
-        block_numbers = tl.gather(block_numbers, block_indices, 0)
+        # c4/c128 cache groups use a compressed table. Their exact compressed
+        # slot mapping is produced by the DSA compressor custom op, so the
+        # generic V2 mapping must be PAD and, critically, must not read the
+        # shortened table using raw positions. For ordinary/SWA groups retain
+        # upstream addressing and mask the table boundary.
+        valid_slot = (
+            (offset < end_idx)
+            & use_generic_slot_mapping
+            & (block_indices < block_table_stride)
+        )
+        block_numbers = tl.load(
+            block_table_ptr + req_state_idx * block_table_stride + block_indices,
+            mask=valid_slot,
+            other=0,
+        )
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
@@ -161,4 +244,5 @@ def _compute_slot_mappings_kernel(
             slot_ids = block_numbers * block_size + local_offsets
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
+        slot_ids = tl.where(valid_slot, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)

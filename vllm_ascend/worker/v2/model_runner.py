@@ -49,6 +49,7 @@ from vllm_ascend.ascend_forward_context import (
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.block_table import block_table_kv_cache_groups_context
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
@@ -141,7 +142,14 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch: AscendInputBatch | None = None
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        with graph_manager_wrapper(self):
+        # The upstream V2 runner only forwards scalar block-table dimensions to
+        # BlockTables. Preserve the full group specs while it constructs the
+        # Ascend replacement so DSA compressed groups retain MRv1 capacity
+        # semantics.
+        with (
+            graph_manager_wrapper(self),
+            block_table_kv_cache_groups_context(kv_cache_config.kv_cache_groups),
+        ):
             super().initialize_kv_cache(kv_cache_config)
 
 

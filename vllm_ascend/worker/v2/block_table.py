@@ -160,6 +160,7 @@ class AscendBlockTables(BlockTables):
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
+            BLOCK_TABLE_TILE_SIZE=4096,
         )
         return self.slot_mappings[:, :num_tokens_padded]
 
@@ -181,6 +182,7 @@ def _compute_slot_mappings_kernel(
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    BLOCK_TABLE_TILE_SIZE: tl.constexpr,
 ):
     # kv cache group id
     group_id = tl.program_id(0)
@@ -221,16 +223,35 @@ def _compute_slot_mappings_kernel(
         # generic V2 mapping must be PAD and, critically, must not read the
         # shortened table using raw positions. For ordinary/SWA groups retain
         # upstream addressing and mask the table boundary.
+        # Ascend Triton lowers a contiguous load plus tl.gather efficiently,
+        # while a direct dynamically-indexed tl.load is not supported by its
+        # MLIR backend. Start the tile at this query chunk's first block so
+        # the mapping works beyond the first 4096 blocks as well.
+        first_position = tl.load(pos + i, mask=i < end_idx, other=0).to(tl.int32)
+        tile_start = first_position // (block_size * CP_SIZE)
+        tile_offsets = tl.arange(0, BLOCK_TABLE_TILE_SIZE)
+        valid_tile_entry = (
+            use_generic_slot_mapping
+            & (tile_start + tile_offsets < block_table_stride)
+        )
+        block_numbers = tl.load(
+            block_table_ptr
+            + req_state_idx * block_table_stride
+            + tile_start
+            + tile_offsets,
+            mask=valid_tile_entry,
+            other=0,
+        )
+        relative_block_indices = block_indices - tile_start
         valid_slot = (
             (offset < end_idx)
             & use_generic_slot_mapping
             & (block_indices < block_table_stride)
+            & (relative_block_indices >= 0)
+            & (relative_block_indices < BLOCK_TABLE_TILE_SIZE)
         )
-        block_numbers = tl.load(
-            block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=valid_slot,
-            other=0,
-        )
+        safe_relative_block_indices = tl.where(valid_slot, relative_block_indices, 0)
+        block_numbers = tl.gather(block_numbers.to(tl.float32), safe_relative_block_indices, 0)
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.

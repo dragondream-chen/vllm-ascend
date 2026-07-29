@@ -129,11 +129,16 @@ class AscendBlockTables(BlockTables):
         # The DSA compressor custom op owns c4/c128 compressed slot mapping.
         # Generic V2 slot mapping must not index those shortened block tables
         # with raw token positions.
-        self.generic_slot_mapping_mask = torch.tensor(
-            [ratio == 1 for ratio in compress_ratios],
-            dtype=torch.bool,
-            device=self.device,
-        )
+        self.generic_slot_mapping_groups = [
+            group_id for group_id, ratio in enumerate(compress_ratios) if ratio == 1
+        ]
+        # Keep the gather source size static for Ascend Triton. A group whose
+        # table is smaller than 4096 uses the largest power-of-two tile that
+        # fits entirely in one row.
+        self.block_table_tile_sizes = [
+            min(4096, 1 << (block_table.gpu.stride(0).bit_length() - 1))
+            for block_table in self.block_tables
+        ]
 
     def compute_slot_mappings(
         self,
@@ -143,25 +148,29 @@ class AscendBlockTables(BlockTables):
         num_tokens_padded: int,
     ) -> torch.Tensor:
         num_reqs = idx_mapping.shape[0]
-        num_groups = self.num_kv_cache_groups
-        _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
-            self.max_num_batched_tokens,
-            idx_mapping,
-            query_start_loc,
-            positions,
-            self.block_table_ptrs,
-            self.block_table_strides,
-            self.block_sizes_tensor,
-            self.generic_slot_mapping_mask,
-            self.slot_mappings,
-            self.slot_mappings.stride(0),
-            self.cp_rank,
-            CP_SIZE=self.cp_size,
-            CP_INTERLEAVE=self.cp_interleave,
-            PAD_ID=PAD_SLOT_ID,
-            TRITON_BLOCK_SIZE=1024,  # type: ignore
-            BLOCK_TABLE_TILE_SIZE=4096,
-        )
+        # c4/c128 compressed groups do not consume the generic slot mapping:
+        # the DSA compressor custom op produces their exact mapping. Fill them
+        # with PAD and only launch the generic kernel for ratio==1 groups.
+        self.slot_mappings.fill_(PAD_SLOT_ID)
+        for group_id in self.generic_slot_mapping_groups:
+            _compute_slot_mappings_kernel[(num_reqs + 1,)](
+                self.max_num_batched_tokens,
+                idx_mapping,
+                query_start_loc,
+                positions,
+                self.block_table_ptrs,
+                self.block_table_strides,
+                self.block_sizes_tensor,
+                self.slot_mappings,
+                self.slot_mappings.stride(0),
+                self.cp_rank,
+                GROUP_ID=group_id,
+                CP_SIZE=self.cp_size,
+                CP_INTERLEAVE=self.cp_interleave,
+                PAD_ID=PAD_SLOT_ID,
+                TRITON_BLOCK_SIZE=1024,  # type: ignore
+                BLOCK_TABLE_TILE_SIZE=self.block_table_tile_sizes[group_id],
+            )
         return self.slot_mappings[:, :num_tokens_padded]
 
 
@@ -174,22 +183,23 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
-    generic_slot_mapping_mask,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
+    GROUP_ID: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
     BLOCK_TABLE_TILE_SIZE: tl.constexpr,
 ):
-    # kv cache group id
-    group_id = tl.program_id(0)
-    batch_idx = tl.program_id(1)
+    # One launch per group keeps the group id and gather width constexpr for
+    # the Ascend Triton backend.
+    group_id = GROUP_ID
+    batch_idx = tl.program_id(0)
     slot_mapping_ptr = slot_mappings_ptr + group_id * slot_mappings_stride
 
-    if batch_idx == tl.num_programs(1) - 1:
+    if batch_idx == tl.num_programs(0) - 1:
         actual_num_tokens = tl.load(query_start_loc + batch_idx)
         for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
             offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
@@ -199,7 +209,6 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
-    use_generic_slot_mapping = tl.load(generic_slot_mapping_mask + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -218,40 +227,16 @@ def _compute_slot_mappings_kernel(
         # replace the % operation with sub and mul instead
         block_offsets = positions - (block_size * CP_SIZE) * block_indices
 
-        # c4/c128 cache groups use a compressed table. Their exact compressed
-        # slot mapping is produced by the DSA compressor custom op, so the
-        # generic V2 mapping must be PAD and, critically, must not read the
-        # shortened table using raw positions. For ordinary/SWA groups retain
-        # upstream addressing and mask the table boundary.
-        # Ascend Triton lowers a contiguous load plus tl.gather efficiently,
-        # while a direct dynamically-indexed tl.load is not supported by its
-        # MLIR backend. Start the tile at this query chunk's first block so
-        # the mapping works beyond the first 4096 blocks as well.
-        first_position = tl.load(pos + i, mask=i < end_idx, other=0).to(tl.int32)
-        tile_start = first_position // (block_size * CP_SIZE)
-        tile_offsets = tl.arange(0, BLOCK_TABLE_TILE_SIZE)
-        valid_tile_entry = (
-            use_generic_slot_mapping
-            & (tile_start + tile_offsets < block_table_stride)
-        )
         block_numbers = tl.load(
             block_table_ptr
             + req_state_idx * block_table_stride
-            + tile_start
-            + tile_offsets,
-            mask=valid_tile_entry,
-            other=0,
+            + tl.arange(0, BLOCK_TABLE_TILE_SIZE)
         )
-        relative_block_indices = block_indices - tile_start
-        valid_slot = (
-            (offset < end_idx)
-            & use_generic_slot_mapping
-            & (block_indices < block_table_stride)
-            & (relative_block_indices >= 0)
-            & (relative_block_indices < BLOCK_TABLE_TILE_SIZE)
+        valid_slot = (offset < end_idx) & (block_indices < BLOCK_TABLE_TILE_SIZE)
+        safe_block_indices = tl.where(valid_slot, block_indices, 0)
+        block_numbers = tl.gather(
+            block_numbers.to(tl.float32), safe_block_indices, 0
         )
-        safe_relative_block_indices = tl.where(valid_slot, relative_block_indices, 0)
-        block_numbers = tl.gather(block_numbers.to(tl.float32), safe_relative_block_indices, 0)
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.

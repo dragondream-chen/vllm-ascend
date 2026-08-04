@@ -950,19 +950,6 @@
 #       fix, and the supported HunyuanOCR tokenizer artifacts expose the named
 #       special-token schema required by Transformers 5.13.
 #
-# ** 19. File: worker/patch_qwen3_next_mtp.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.worker.utils.bind_kv_cache`
-#    Why:
-#       'bind_kv_cache' func will raise an exception when current_platform is npu.
-#    How：
-#       Replace with a new bind_kv_cache.
-#       Skip the raise.
-#    Related PR (if no, explain why):
-#       It need discuss.
-#    Future Plan:
-#       Remove this patch after discussing with vllm community and adapting bind_kv_cache to npu.
-#
 # ** 20. File: worker/patch_qwen3vl.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration._get_deepstack_input_embeds`

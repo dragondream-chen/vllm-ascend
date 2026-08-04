@@ -168,6 +168,10 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
+from vllm_ascend.worker.kv_cache_utils import (
+    bind_deepseek_v4_kv_cache_v1,
+    bind_kv_cache,
+)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -3634,20 +3638,13 @@ class NPUModelRunner(GPUModelRunner):
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
         if self.model_config.hf_text_config.model_type == "deepseek_v4":
-            from vllm_ascend.utils import extract_dsv4_layer_index
-
-            assert len(self.kv_caches) == 0
-            for layer_name in sorted(
-                    kv_caches,
-                    key=lambda name: (extract_dsv4_layer_index(
-                        self.model_config.hf_text_config, name), name)):
-                self.kv_caches.append(kv_caches[layer_name])
-            for layer_name, kv_cache in kv_caches.items():
-                self.compilation_config.static_forward_context[
-                    layer_name].kv_cache = [kv_cache]
+            bind_deepseek_v4_kv_cache_v1(
+                kv_caches,
+                self.compilation_config.static_forward_context,
+                self.kv_caches,
+                self.model_config.hf_text_config,
+            )
         else:
-            from vllm.v1.worker.utils import bind_kv_cache
-
             model_type = self.model_config.hf_text_config.model_type
             num_attn_module = 2 if model_type in ("longcat_flash", "longcat_flash_ngram") else 1
             bind_kv_cache(

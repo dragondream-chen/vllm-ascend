@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
-from vllm.forward_context import is_forward_context_available
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -152,10 +152,18 @@ class NPUModelRunner(GPUModelRunner):
 
         num_tokens = input_ids.shape[0]
         moe_comm_type = select_moe_comm_method(num_tokens, self.vllm_config)
+        moe_comm_method = get_moe_comm_method(moe_comm_type)
+        # Legacy hash routing reads attributes directly from ForwardContext,
+        # while other Ascend paths read the V2 additional_kwargs proxy. Keep
+        # both views in sync until the router is migrated to the proxy.
+        forward_context = get_forward_context()
+        forward_context.input_ids = input_ids
+        forward_context.moe_comm_type = moe_comm_type
+        forward_context.moe_comm_method = moe_comm_method
+        forward_context.flash_comm_v1_enabled = False
         _EXTRA_CTX.input_ids = input_ids
         _EXTRA_CTX.moe_comm_type = moe_comm_type
-        _EXTRA_CTX.moe_comm_method = get_moe_comm_method(moe_comm_type)
-        # The current MRV2 DeepSeek-V4 graph scope excludes FlashComm-v1.
+        _EXTRA_CTX.moe_comm_method = moe_comm_method
         _EXTRA_CTX.flash_comm_v1_enabled = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):

@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.forward_context import is_forward_context_available
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -43,6 +44,7 @@ from vllm.v1.worker.gpu.model_runner import (
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
     MoECommType,
     get_mc2_tokens_capacity,
     override_mrv2_in_profile_run,
@@ -116,6 +118,45 @@ class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
     execute_model_state: ExecuteModelState | None
+
+    def load_model(self, *args, **kwargs) -> None:
+        """Load the model, then install MRV2's Ascend MoE context hook."""
+        super().load_model(*args, **kwargs)
+        # GPUModelRunner creates self.model in load_model(), not __init__.
+        # Install the hook afterwards so eager, warmup, and ACL graph capture
+        # can all expose the current graph input IDs to hash MoE routing.
+        self.model.register_forward_pre_hook(
+            self._populate_ascend_moe_forward_context,
+            with_kwargs=True,
+        )
+
+    def _populate_ascend_moe_forward_context(
+        self,
+        _module: torch.nn.Module,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        """Populate MRV2's Ascend MoE context from model graph inputs."""
+        if not is_forward_context_available():
+            return
+
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is None:
+            # Non-first pipeline stages use intermediate tensors and do not
+            # have raw token IDs available for DeepSeek-V4 hash routing.
+            return
+
+        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+
+        num_tokens = input_ids.shape[0]
+        moe_comm_type = select_moe_comm_method(num_tokens, self.vllm_config)
+        _EXTRA_CTX.input_ids = input_ids
+        _EXTRA_CTX.moe_comm_type = moe_comm_type
+        _EXTRA_CTX.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        # The current MRV2 DeepSeek-V4 graph scope excludes FlashComm-v1.
+        _EXTRA_CTX.flash_comm_v1_enabled = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations

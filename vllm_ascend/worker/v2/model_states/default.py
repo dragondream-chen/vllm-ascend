@@ -25,7 +25,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm_ascend.ops.rotary_embedding import update_cos_sin
+from vllm_ascend.worker.v2.attn_utils import DSA_CAPTURE_DUMMY_POSITION, build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 
@@ -55,6 +57,16 @@ class AscendModelState(DefaultModelState):
         num_actual_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
+        if for_capture and any(
+            isinstance(attn_group.get_metadata_builder(0), AscendDSAMetadataBuilder)
+            for cache_groups in attn_groups
+            for attn_group in cache_groups
+        ):
+            # FULL graph capture must see the same dummy RoPE positions as
+            # MRV1. Do this before metadata construction so the model and DSA
+            # consume a synchronized RoPE buffer during capture.
+            input_batch.positions.fill_(DSA_CAPTURE_DUMMY_POSITION)
+            update_cos_sin(input_batch.positions)
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.attn_metadata = build_attn_metadata(

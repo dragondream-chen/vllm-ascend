@@ -368,6 +368,11 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc.num_reqs,
             )
 
+        # DSA builds host-side sparse-attention metadata from seq_lens. Unlike
+        # the device kernel, this buffer is not cleared by prepare_pos_seq_lens,
+        # so clear all graph-padding rows before exposing it to metadata builders.
+        self.input_buffers.seq_lens_np[num_reqs:] = 0
+
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
 
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]

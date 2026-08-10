@@ -186,6 +186,9 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
             call[cache_name].setdefault("first_group", len(self.calls) == 1)
         return SimpleNamespace(common_attn_metadata=common_attn_metadata)
 
+    def build_for_cudagraph_capture(self, *args, **kwargs):
+        raise AssertionError("DSA graph capture must use build() to match MRV1")
+
 
 def _make_dsa_metadata_groups():
     layer_names = [
@@ -280,7 +283,8 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             query_start_loc=torch.tensor([0, 2, 5, 5, 5], dtype=torch.int32),
             num_scheduled_tokens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
-            seq_lens_np=np.array([2, 3, 0, 0], dtype=np.int32),
+            seq_lens_np=np.array([2, 3, 99, 88], dtype=np.int32),
+            seq_lens_cpu_upper_bound=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             dcp_local_seq_lens=None,
             positions=torch.arange(8, dtype=torch.int32),
             attn_state=None,
@@ -303,6 +307,17 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
         common_metadata = call["common_attn_metadata"]
         assert common_metadata.num_actual_tokens == 5
         assert common_metadata.num_input_tokens == expected_input_tokens
+        if caller == "model_state" and cudagraph_mode == CUDAGraphMode.FULL:
+            assert torch.equal(
+                common_metadata._seq_lens_cpu,
+                torch.tensor([2, 3, 0, 0], dtype=torch.int32),
+            )
+    if for_cudagraph_capture:
+        assert torch.equal(
+            calls[0]["common_attn_metadata"].positions,
+            torch.full((5,), attn_utils.DSA_CAPTURE_DUMMY_POSITION, dtype=torch.int32),
+        )
+
     for cache_name in (
         "prefill_ratio_to_sas_metadata",
         "decode_ratio_to_sas_metadata",

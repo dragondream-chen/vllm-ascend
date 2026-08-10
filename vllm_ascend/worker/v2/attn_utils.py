@@ -50,6 +50,8 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import AscendDeviceType, calc_split_factor, get_ascend_device_type
 
+DSA_CAPTURE_DUMMY_POSITION = 127
+
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
@@ -124,6 +126,8 @@ def build_attn_metadata(
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
     if seq_lens_cpu_upper_bound is None:
         seq_lens_cpu_upper_bound = seq_lens_cpu
+    else:
+        seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     # Upstream speculative-decoding callers do not provide Ascend's separate
     # scheduled-token and padded-input-token counts. Without these fields,
@@ -161,6 +165,7 @@ def build_attn_metadata(
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            _seq_lens_cpu=seq_lens_cpu_upper_bound,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_actual_tokens,
@@ -178,7 +183,14 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
+            if for_cudagraph_capture and isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
+                # Match MRV1's DSA capture setup. DSA metadata and its RoPE
+                # inputs are captured with a non-zero dummy position, and DSA
+                # deliberately bypasses the generic capture hook.
+                assert positions is not None
+                positions.fill_(DSA_CAPTURE_DUMMY_POSITION)
+
+            if for_cudagraph_capture and not isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata,
                     **(

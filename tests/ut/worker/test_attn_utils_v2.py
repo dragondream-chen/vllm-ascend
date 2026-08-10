@@ -172,6 +172,7 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
         call = {
             "common_attn_metadata": common_attn_metadata,
             "block_size": kwargs["block_size"],
+            "num_reqs_actual": kwargs["num_reqs_actual"],
             "prefill_ratio_to_sas_metadata": self.prefill_ratio_to_sas_metadata,
             "decode_ratio_to_sas_metadata": self.decode_ratio_to_sas_metadata,
             "common_ratio_to_sas_metadata": self.common_ratio_to_sas_metadata,
@@ -229,17 +230,19 @@ def _make_dsa_metadata_groups():
 
 
 @pytest.mark.parametrize(
-    ("caller", "cudagraph_mode", "expected_input_tokens"),
+    ("caller", "cudagraph_mode", "expected_input_tokens", "for_cudagraph_capture"),
     [
-        ("default", None, 5),
-        ("model_state", CUDAGraphMode.NONE, 5),
-        ("model_state", CUDAGraphMode.FULL, 8),
+        ("default", None, 5, False),
+        ("default", None, 5, True),
+        ("model_state", CUDAGraphMode.NONE, 5, False),
+        ("model_state", CUDAGraphMode.FULL, 8, False),
     ],
 )
 def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     caller,
     cudagraph_mode,
     expected_input_tokens,
+    for_cudagraph_capture,
 ):
     layer_names, specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
     block_tables = (
@@ -263,6 +266,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             kv_cache_config=kv_cache_config,
             seq_lens_np=np.array([2, 3], dtype=np.int32),
             positions=torch.arange(5, dtype=torch.int32),
+            for_cudagraph_capture=for_cudagraph_capture,
         )
     else:
         model_state = AscendModelState.__new__(AscendModelState)
@@ -288,11 +292,13 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             slot_mappings=slot_mappings,
             attn_groups=attn_groups,
             kv_cache_config=kv_cache_config,
+            for_capture=for_cudagraph_capture,
         )
 
     assert set(metadata) == set(layer_names)
     assert [call["block_size"] for call in calls] == [spec.block_size for spec in specs]
     assert len(calls) == 2
+    assert [call["num_reqs_actual"] for call in calls] == [2, 2]
     for call in calls:
         common_metadata = call["common_attn_metadata"]
         assert common_metadata.num_actual_tokens == 5

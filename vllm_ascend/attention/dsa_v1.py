@@ -1352,7 +1352,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             return common_attn_metadata.num_reqs
         return self.num_decodes
 
-    def build_for_graph_capture(
+    def build_for_cudagraph_capture(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,

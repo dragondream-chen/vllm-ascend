@@ -108,6 +108,7 @@ def build_attn_metadata(
     attn_state: Any | None = None,
     graph_pad_size: int = -1,
     num_actual_tokens: int | None = None,
+    num_reqs_actual: int | None = None,
     num_input_tokens: int | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
@@ -133,6 +134,8 @@ def build_attn_metadata(
     if num_input_tokens is None:
         num_input_tokens = num_tokens
 
+    if num_reqs_actual is None:
+        num_reqs_actual = num_reqs
     attn_metadata: dict[str, Any] = {}
     # DSA metadata is shared by the ratio-specific cache groups for one model
     # execution. Keep the cache at the batch-builder scope,
@@ -176,7 +179,20 @@ def build_attn_metadata(
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
+                metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                    common_attn_metadata,
+                    **(
+                        {
+                            "num_reqs_actual": num_reqs_actual,
+                            "prefill_ratio_to_sas_metadata": prefill_ratio_to_sas_metadata,
+                            "decode_ratio_to_sas_metadata": decode_ratio_to_sas_metadata,
+                            "common_ratio_to_sas_metadata": common_ratio_to_sas_metadata,
+                            "block_size": attn_group.kv_cache_spec.block_size,
+                        }
+                        if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
+                        else {}
+                    ),
+                )
             else:
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
@@ -188,7 +204,7 @@ def build_attn_metadata(
                 )
                 if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
                     attn_metadata_extra_kwargs.update(
-                        num_reqs_actual=num_reqs,
+                        num_reqs_actual=num_reqs_actual,
                         prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
                         decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
@@ -199,12 +215,12 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
-                if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
-                    # Preserve sharing even if a builder replaces one of the
-                    # dictionaries while constructing its metadata.
-                    prefill_ratio_to_sas_metadata = attn_metadata_builder.prefill_ratio_to_sas_metadata  # type: ignore[assignment]
-                    decode_ratio_to_sas_metadata = attn_metadata_builder.decode_ratio_to_sas_metadata  # type: ignore[assignment]
-                    common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
+            if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
+                # Preserve sharing even if a builder replaces one of the
+                # dictionaries while constructing its metadata.
+                prefill_ratio_to_sas_metadata = attn_metadata_builder.prefill_ratio_to_sas_metadata  # type: ignore[assignment]
+                decode_ratio_to_sas_metadata = attn_metadata_builder.decode_ratio_to_sas_metadata  # type: ignore[assignment]
+                common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

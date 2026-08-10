@@ -197,10 +197,12 @@ class ModelWithContext(nn.Module):
             return self.original_model(*args, **kwargs)
 
         forward_context = get_forward_context()
+        batch_descriptor = forward_context.batch_descriptor
+        assert batch_descriptor is not None
         with set_ascend_forward_context(
             forward_context.attn_metadata,
             self.vllm_config,
-            num_tokens=forward_context.num_tokens,
+            num_tokens=batch_descriptor.num_tokens,
             num_tokens_across_dp=forward_context.num_tokens_across_dp,
             aclgraph_runtime_mode=forward_context.cudagraph_runtime_mode,
             batch_descriptor=forward_context.batch_descriptor,

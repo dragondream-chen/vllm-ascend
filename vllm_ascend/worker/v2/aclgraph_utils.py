@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -34,7 +34,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -51,6 +51,16 @@ def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
     capture descriptors, not the raw config sizes.
     """
     return sorted({desc.num_tokens for descs in capture_descs.values() for desc in descs})
+
+
+def get_num_actual_tokens(attn_metadata: Any, fallback: int) -> int:
+    """Get unpadded token count from an attention metadata container."""
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if isinstance(attn_metadata, dict):
+        attn_metadata = next(iter(attn_metadata.values()), None)
+    num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+    return num_actual_tokens if isinstance(num_actual_tokens, int) else fallback
 
 
 class ModelAclGraphManager(ModelCudaGraphManager):
@@ -90,25 +100,28 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             set_graph_params(self.capture_sizes)
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        """Override run_fullgraph to update full graph params in run_fullgraph."""
+        """Run the full graph with the same Ascend context as MRV1."""
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
 
-        # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
+        # Refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
         num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens)
-        with set_forward_context(
-            self.model_runner.model_state.attn_metadata,
+        attn_metadata = self.model_runner.model_state.attn_metadata
+        with set_ascend_forward_context(
+            attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
+            num_actual_tokens=get_num_actual_tokens(attn_metadata, num_tokens),
             cudagraph_runtime_mode=desc.cg_mode,
             num_tokens_across_dp=num_tokens_across_dp,
-            batch_descriptor=None,  # Full graph model don't need batch_descriptor
-            slot_mapping=None,
+            batch_descriptor=None,
+            model_instance=self.model_runner.model,
+            has_sinks=getattr(self.model_runner, "_has_sinks", False),
         ):
+            ret = super().run_fullgraph(desc)
             forward_context = get_forward_context()
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
@@ -136,7 +149,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
-        model = ModelWithContext(model)
+        model = ModelWithContext(model, self.vllm_config)
         with communicator_switch():
             return super().capture(
                 model,
@@ -158,23 +171,48 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False):
+    def __init__(
+        self,
+        original_model,
+        vllm_config: VllmConfig | None = None,
+        is_draft_model: bool = False,
+        is_draft_model_prefill: bool = False,
+    ):
         super().__init__()
         self.original_model = original_model
+        self.vllm_config = vllm_config
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
 
     def forward(self, *args, **kwargs):
         # In warmup phase, capturing=False by default.
-        # when capturing, we need to set capturing=True in forward context.
-        if torch.npu.is_current_stream_capturing():
-            _EXTRA_CTX.capturing = True
-        if self.is_draft_model:
-            _EXTRA_CTX.is_draft_model = True
-        if self.is_draft_model_prefill:
-            _EXTRA_CTX.is_draft_model_prefill = True
+        # When capturing, we need to set capturing=True in forward context.
+        if self.vllm_config is None:
+            if torch.npu.is_current_stream_capturing():
+                _EXTRA_CTX.capturing = True
+            if self.is_draft_model:
+                _EXTRA_CTX.is_draft_model = True
+            if self.is_draft_model_prefill:
+                _EXTRA_CTX.is_draft_model_prefill = True
+            return self.original_model(*args, **kwargs)
 
-        return self.original_model(*args, **kwargs)
+        forward_context = get_forward_context()
+        with set_ascend_forward_context(
+            forward_context.attn_metadata,
+            self.vllm_config,
+            num_tokens=forward_context.num_tokens,
+            num_tokens_across_dp=forward_context.num_tokens_across_dp,
+            aclgraph_runtime_mode=forward_context.cudagraph_runtime_mode,
+            batch_descriptor=forward_context.batch_descriptor,
+            model_instance=self.original_model,
+            is_draft_model=self.is_draft_model,
+            skip_compiled=forward_context.skip_compiled,
+        ):
+            if torch.npu.is_current_stream_capturing():
+                _EXTRA_CTX.capturing = True
+            if self.is_draft_model_prefill:
+                _EXTRA_CTX.is_draft_model_prefill = True
+            return self.original_model(*args, **kwargs)
 
     def get_original_model(self):
         return self.original_model
@@ -200,7 +238,11 @@ class ModelWithContext(nn.Module):
 def model_capture_wrapper(speculator, is_draft_model_prefill):
     """Context manager to override speculator's model for speculator capturing."""
     try:
-        speculator.model = ModelWithContext(speculator.model, True, is_draft_model_prefill)
+        speculator.model = ModelWithContext(
+            speculator.model,
+            is_draft_model=True,
+            is_draft_model_prefill=is_draft_model_prefill,
+        )
         yield
     finally:
         speculator.model = speculator.model.get_original_model()

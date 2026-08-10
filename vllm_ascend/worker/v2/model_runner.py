@@ -67,6 +67,18 @@ from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
 
+def _is_dsv4_dsa(vllm_config: VllmConfig) -> bool:
+    """Whether the model uses DeepSeek-V4 DSA graph semantics."""
+    model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", hf_config)
+    return (
+        hf_config is not None
+        and getattr(hf_text_config, "model_type", None) == "deepseek_v4"
+        and (hasattr(hf_config, "compress_ratios") or hasattr(hf_text_config, "compress_ratios"))
+    )
+
+
 # TODO: remove this wrapper when vllm-ascend supports sequence parallel on model runner v2.
 @contextmanager
 def flashcomm_dispatch_wrapper(vllm_config: VllmConfig):
@@ -132,6 +144,7 @@ class NPUModelRunner(GPUModelRunner):
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
+        self.is_dsv4_dsa = _is_dsv4_dsa(vllm_config)
         self.use_aclgraph = (
             self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
@@ -376,7 +389,9 @@ class NPUModelRunner(GPUModelRunner):
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
 
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
-        query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+        # Real input preparation must not consume graph-only padding. Keep the
+        # padded view below for attention metadata and graph replay.
+        query_start_loc_actual = self.input_buffers.query_start_loc[: num_reqs + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
         num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
@@ -389,7 +404,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
                 idx_mapping,
-                query_start_loc,
+                query_start_loc_actual,
                 self.req_states.all_token_ids.gpu,
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
@@ -398,15 +413,22 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare positions and seq_lens.
         prepare_pos_seq_lens(
             idx_mapping,
-            query_start_loc,
+            query_start_loc_actual,
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
         )
-        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        seq_lens = self.input_buffers.seq_lens[:num_reqs]
 
-        # Pad for full CUDA graph mode.
-        self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
+        if self.is_dsv4_dsa:
+            # DSA capture uses position 127 to exercise the compressor
+            # boundary. Actual requests overwrite their own rows above, so
+            # clear graph-only padding before replay updates DSA RoPE buffers.
+            self.input_buffers.positions[num_tokens:num_tokens_after_padding].zero_()
+
+        # CPU lengths are consumed by DSA metadata. Clear all unused rows,
+        # including a possible FIA dummy request.
+        self.input_buffers.seq_lens_np[num_reqs:] = 0
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
@@ -414,7 +436,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_buffers.input_ids,
             idx_mapping,
             self.req_states.last_sampled_tokens,
-            query_start_loc,
+            query_start_loc_actual,
             seq_lens,
             self.req_states.prefill_len.gpu,
             self.req_states.draft_tokens,
@@ -444,6 +466,8 @@ class NPUModelRunner(GPUModelRunner):
             # prompt_lens is only used in R-SWA case.
             prompt_lens = self.req_states.prompt_len.gpu[idx_mapping]
 
+        query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         input_batch = AscendInputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,

@@ -183,57 +183,36 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
+            attn_metadata_extra_kwargs = (
+                model_specific_attn_metadata.get_extra_attn_kwargs(
+                    attn_metadata_builder,
+                    num_reqs,
+                )
+                if model_specific_attn_metadata is not None
+                else {}
+            )
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
-            if for_cudagraph_capture and is_dsa_builder:
-                # Match MRV1: DSA capture metadata must remain private to each
-                # builder. In particular, ratio-specific SAS / QLI entries are
-                # not safe to reuse across compressed cache groups.
-                builder_prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
-                builder_decode_ratio_to_sas_metadata: dict[Any, Any] = {}
-                builder_common_ratio_to_sas_metadata: dict[Any, Any] = {}
-            else:
-                builder_prefill_ratio_to_sas_metadata = prefill_ratio_to_sas_metadata
-                builder_decode_ratio_to_sas_metadata = decode_ratio_to_sas_metadata
-                builder_common_ratio_to_sas_metadata = common_ratio_to_sas_metadata
+            if is_dsa_builder:
+                # DSA cache groups share address-stable graph inputs. Capture
+                # must use the same dictionaries as replay so every group is
+                # wired to buffers that runtime metadata updates in place.
+                attn_metadata_extra_kwargs.update(
+                    num_reqs_actual=num_reqs_actual,
+                    prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
+                    decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
+                    common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                    block_size=attn_group.kv_cache_spec.block_size,
+                )
 
             if for_cudagraph_capture and not is_dsa_builder:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata,
-                    **(
-                        {
-                            "num_reqs_actual": num_reqs_actual,
-                            "prefill_ratio_to_sas_metadata": prefill_ratio_to_sas_metadata,
-                            "decode_ratio_to_sas_metadata": decode_ratio_to_sas_metadata,
-                            "common_ratio_to_sas_metadata": common_ratio_to_sas_metadata,
-                            "block_size": attn_group.kv_cache_spec.block_size,
-                        }
-                        if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
-                        else {}
-                    ),
-                )
+                metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
-                    )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                if is_dsa_builder:
-                    attn_metadata_extra_kwargs.update(
-                        num_reqs_actual=num_reqs_actual,
-                        prefill_ratio_to_sas_metadata=builder_prefill_ratio_to_sas_metadata,
-                        decode_ratio_to_sas_metadata=builder_decode_ratio_to_sas_metadata,
-                        common_ratio_to_sas_metadata=builder_common_ratio_to_sas_metadata,
-                        block_size=attn_group.kv_cache_spec.block_size,
-                    )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
-            if is_dsa_builder and not for_cudagraph_capture:
+            if is_dsa_builder:
                 # Preserve sharing even if a builder replaces one of the
                 # dictionaries while constructing its metadata.
                 prefill_ratio_to_sas_metadata = attn_metadata_builder.prefill_ratio_to_sas_metadata  # type: ignore[assignment]

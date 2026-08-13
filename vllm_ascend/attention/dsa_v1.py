@@ -450,6 +450,21 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     ).to(torch.bfloat16)
         self.start_pos_prefill = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
         self.start_pos_decode = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+        self.decode_input_positions = torch.zeros(
+            scheduler_config.max_num_batched_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.decode_query_start_loc = torch.zeros(
+            scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.decode_seq_lens = torch.zeros(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.decode_sas_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
         self.decode_qli_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
@@ -548,14 +563,21 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
         num_reqs_actual = kwargs.get("num_reqs_actual")
+        # Runtime builds share these dictionaries across DSA cache groups via
+        # ModelRunner V2. ACLGraph capture calls the generic builder directly,
+        # so initialize group-local dictionaries when the shared ones are not
+        # available yet.
         self.prefill_ratio_to_sas_metadata = kwargs.get("prefill_ratio_to_sas_metadata")
+        if self.prefill_ratio_to_sas_metadata is None:
+            self.prefill_ratio_to_sas_metadata = {}
         self.decode_ratio_to_sas_metadata = kwargs.get("decode_ratio_to_sas_metadata")
-        assert self.prefill_ratio_to_sas_metadata is not None
-        assert self.decode_ratio_to_sas_metadata is not None
+        if self.decode_ratio_to_sas_metadata is None:
+            self.decode_ratio_to_sas_metadata = {}
         self.block_size = kwargs.get("block_size", self.kv_cache_spec.block_size)
 
         self.common_ratio_to_sas_metadata = kwargs.get("common_ratio_to_sas_metadata")
-        assert self.common_ratio_to_sas_metadata is not None
+        if self.common_ratio_to_sas_metadata is None:
+            self.common_ratio_to_sas_metadata = {}
 
         if self.common_ratio_to_sas_metadata.get("num_decodes", None) is None:
             self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
@@ -570,14 +592,22 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
             num_input_tokens = common_attn_metadata.num_input_tokens
             input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+            self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+            if self.num_prefills == 0:
+                self.decode_input_positions[:num_input_tokens].copy_(input_positions)
+                self.decode_query_start_loc[: num_reqs + 1].copy_(query_start_loc[: num_reqs + 1])
+                self.decode_seq_lens[:num_reqs].copy_(self.seq_lens)
+                input_positions = self.decode_input_positions[:num_input_tokens]
+                query_start_loc = self.decode_query_start_loc[: num_reqs + 1]
+                self.seq_lens = self.decode_seq_lens[:num_reqs]
             self.common_ratio_to_sas_metadata["input_positions"] = input_positions
+            self.common_ratio_to_sas_metadata["query_start_loc"] = query_start_loc
             if self.num_prefills:
                 cos, sin = get_cos_and_sin_dsa(input_positions)
             else:
                 cos, sin = get_cos_and_sin_dsa(input_positions, True)
             self.common_ratio_to_sas_metadata["cos"] = cos
             self.common_ratio_to_sas_metadata["sin"] = sin
-            self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
             self.common_ratio_to_sas_metadata["seq_lens"] = self.seq_lens
 
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -594,6 +624,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.set_num_actual_tokens(common_attn_metadata)
             num_input_tokens = common_attn_metadata.num_input_tokens
             input_positions = self.common_ratio_to_sas_metadata["input_positions"]
+            query_start_loc = self.common_ratio_to_sas_metadata["query_start_loc"]
             cos, sin = self.common_ratio_to_sas_metadata["cos"], self.common_ratio_to_sas_metadata["sin"]
             self.seq_lens = self.common_ratio_to_sas_metadata["seq_lens"]
             self.query_lens = self.common_ratio_to_sas_metadata["query_lens"]
@@ -867,9 +898,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     ) -> AscendDSADecodeMetadata:
         assert self.decode_ratio_to_sas_metadata is not None
         if self.decode_ratio_to_sas_metadata.get("query_start_loc", None) is None:
-            query_start_loc = common_attn_metadata.query_start_loc[: self.num_decodes + 1]
+            query_start_loc = self.common_ratio_to_sas_metadata["query_start_loc"][: self.num_decodes + 1]
             self.decode_ratio_to_sas_metadata["query_start_loc"] = query_start_loc
-            input_positions = common_attn_metadata.positions[: self.num_decode_tokens].long()
+            input_positions = self.common_ratio_to_sas_metadata["input_positions"][: self.num_decode_tokens]
             self.decode_ratio_to_sas_metadata["input_positions"] = input_positions
             cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
             self.decode_ratio_to_sas_metadata["cos"] = cos

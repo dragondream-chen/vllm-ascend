@@ -312,12 +312,6 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
                 common_metadata._seq_lens_cpu,
                 torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             )
-    if for_cudagraph_capture:
-        assert torch.equal(
-            calls[0]["common_attn_metadata"].positions,
-            torch.full((5,), attn_utils.DSA_CAPTURE_DUMMY_POSITION, dtype=torch.int32),
-        )
-
     for cache_name in (
         "prefill_ratio_to_sas_metadata",
         "decode_ratio_to_sas_metadata",

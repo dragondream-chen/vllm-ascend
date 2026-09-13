@@ -116,8 +116,6 @@ class NodeShardedEngram(nn.Module):
             raise ValueError("Engram storage_format must be bf16, int8, fp8, or mxfp8")
         if storage_format in ("int8", "fp8", "mxfp8") and width % 32:
             raise ValueError("INT8 Engram requires a width divisible by 32")
-        if cpu_offload and storage_format == "bf16":
-            raise ValueError("Engram CPU offload requires compressed storage")
         self.storage_format = storage_format
         self.rows, self.width = rows, width
         self.query_group = query_group
@@ -211,10 +209,10 @@ class NodeShardedEngram(nn.Module):
                 codes = torch.index_select(self.weight, 0, flat_ids)
                 scales = torch.index_select(self.weight_scale, 0, flat_ids)
                 rows = dequantize_engram_rows(codes, scales)
-        elif self.storage_format in ("int8", "fp8", "mxfp8"):
+        elif self.offload_pinned:
             # index_select avoids the extra advanced-indexing wrapper on the
             # CPU-resident PLE table and keeps row selection explicit.
-            if self.storage_format != "int8":
+            if self.storage_format in ("fp8", "mxfp8"):
                 rows = torch.index_select(self.weight, 0, flat_ids)
                 decoded = rows.float().reshape(-1, self.width // 32, 32)
                 scales = torch.index_select(self.weight_scale, 0, flat_ids)
@@ -261,6 +259,8 @@ class NodeShardedEngram(nn.Module):
                     torch.ops._C_ascend.engram_int8_lookup_cpu(
                         self.weight, self.weight_scale, flat_ids.contiguous(), decoded_slot
                     )
+                elif self.storage_format == "bf16":
+                    torch.index_select(self.weight, 0, flat_ids, out=decoded_slot)
                 else:
                     decoded_slot.copy_(decoded)
                 rows = decoded_slot
@@ -272,6 +272,8 @@ class NodeShardedEngram(nn.Module):
                     torch.ops._C_ascend.engram_int8_lookup_cpu(
                         self.weight, self.weight_scale, flat_ids.contiguous(), rows
                     )
+                elif self.storage_format == "bf16":
+                    rows = torch.index_select(self.weight, 0, flat_ids)
                 else:
                     rows = decoded.bfloat16()
         else:
@@ -289,23 +291,37 @@ class NodeShardedEngram(nn.Module):
     def load_checkpoint(self, model_path, key, chunk_rows=65536):
         """Load BF16, INT8, FP8, or MXFP8 Engram tensors with bounded IO.
 
-        Offloaded INT8 and FP8/MXFP8 remain CPU resident; only decoded BF16 rows
+        Offloaded tables remain CPU resident; only requested BF16 rows
         enter the node-local all-to-all response buffer.
         """
         root = Path(model_path)
         scale_key = key.removesuffix(".weight") + ".scale"
-        indexes = [
-            root / name for name in ("model.safetensors.index.json", "quant_model_weights.safetensors.index.json")
-        ]
+        names = ("quant_model_weights.safetensors.index.json", "model.safetensors.index.json")
+        source_dtypes = ("BF16", "I8", "INT8") if self.storage_format == "int8" else ("BF16",)
+        if self.storage_format in ("fp8", "mxfp8"):
+            names = names[::-1]
+            source_dtypes = ("F8_E4M3", "F8_E4M3FN")
         found = False
-        for path in indexes:
+        key_found = False
+        for name in names:
+            path = root / name
             if not path.is_file():
                 continue
             found = True
             index = json.loads(path.read_text())["weight_map"]
-            if key in index and (self.storage_format not in ("fp8", "mxfp8") or scale_key in index):
-                break
+            if key not in index:
+                continue
+            key_found = True
+            with safe_open(root / index[key], framework="pt", device="cpu") as file:
+                source_dtype = file.get_slice(key).get_dtype()
+            if source_dtype not in source_dtypes or (source_dtype != "BF16" and scale_key not in index):
+                continue
+            break
         else:
+            if key_found:
+                raise ValueError(
+                    f"{key}: expected {'/'.join(source_dtypes)} source for {self.storage_format} with required scales"
+                )
             if found:
                 raise KeyError(f"{key}: no matching Engram tensors in checkpoint indexes")
             raise FileNotFoundError(f"{root}: Engram loader requires a safetensors index")

@@ -278,21 +278,21 @@ def test_offload_loader_and_pinned_reuse(tmp_path, storage):
     assert torch.equal(table.weight.view(torch.uint8), codes[15:19].view(torch.uint8))
     ids = torch.tensor([0, 3, 0])
     reference = codes[ids + 15] if storage == "bf16" else (codes.float() * scales.float()).bfloat16()[ids + 15]
-    first = table.lookup_local(ids)
+    first = table.lookup_local(ids, pin_output=True)
     assert first.is_pinned()
     torch.testing.assert_close(first.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0)
     event = Mock()
     table._offload_events[first.data_ptr()] = event
-    second = table.lookup_local(ids)
+    second = table.lookup_local(ids, pin_output=True)
     event.synchronize.assert_not_called()
-    third = table.lookup_local(ids)
+    third = table.lookup_local(ids, pin_output=True)
     event.synchronize.assert_called_once_with()
     assert first.data_ptr() == third.data_ptr() != second.data_ptr()
     # Force eviction and verify a still-used pinned source is fenced first.
     event = Mock()
     table._offload_events[third.data_ptr()] = event
     table._offload_buffer_bytes_limit = 1
-    table.lookup_local(ids[:1])
+    table.lookup_local(ids[:1], pin_output=True)
     event.synchronize.assert_called_once_with()
     assert len(table._offload_buffers) == 1
     assert table.lookup_local(torch.empty(0, 2, dtype=torch.int64)).shape == (0, 2, 32)
@@ -357,7 +357,8 @@ def test_int8_loads_bf16_source_without_scale(tmp_path):
 
 
 @pytest.mark.parametrize("width,count", [(32, 0), (32, 1), (256, 255), (256, 256), (256, 521)])
-def test_fused_int8_offload_matches_torch(width, count):
+@pytest.mark.parametrize("pin_output", [False, True])
+def test_fused_int8_offload_matches_torch(width, count, pin_output):
     table = hbm.NodeShardedEngram(257, width, SimpleNamespace(size=1, rank=0), storage_format="int8", cpu_offload=True)
     generator = torch.Generator().manual_seed(20260913)
     table.weight.data.copy_(torch.randint(-128, 128, table.weight.shape, generator=generator, dtype=torch.int8))
@@ -367,7 +368,7 @@ def test_fused_int8_offload_matches_torch(width, count):
     table.weight_scale[1].fill_(-0.0)
     ids = (torch.arange(count * 2) % 257)[::2]
     reference = hbm.dequantize_engram_rows(table.weight[ids], table.weight_scale[ids])
-    actual = table.lookup_local(ids)
+    actual = table.lookup_local(ids, pin_output=pin_output)
     assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
 
 

@@ -218,7 +218,7 @@ class NodeShardedEngram(nn.Module):
                 scales = torch.index_select(self.weight_scale, 0, flat_ids)
                 decoded.mul_(scales.float().unsqueeze(-1))
                 decoded = decoded.reshape(-1, self.width)
-            if self.offload_pinned and pin_output:
+            if pin_output:
                 key = flat_ids.numel()
                 slots = self._offload_buffers.get(key)
                 if slots is None:

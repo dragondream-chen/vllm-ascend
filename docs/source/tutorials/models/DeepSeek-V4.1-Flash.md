@@ -17,8 +17,8 @@ one eighth of DeepSeek-V4-Flash. The model accepts text and images and supports
 a continuously adjustable reasoning effort from 1 to 100.
 
 vLLM Ascend supports W8A8 colocated deployment on either two Atlas 800 A3
-servers or four Atlas 800 A2 servers. Prefill-Decode disaggregation and Engram
-host offloading are not covered by this guide.
+servers or four Atlas 800 A2 servers. A single A3 server can use Engram host
+offload as described below. Prefill-Decode disaggregation is not covered by this guide.
 
 ## 2 Supported Features
 
@@ -348,6 +348,36 @@ curl -sS http://127.0.0.1:8000/v1/models | \
 ```
 
 The response must contain a model entry whose `id` is `deepseek-v41`.
+
+### 5.3 Single A3 with Engram Host Offload
+
+Rebuild the native extension after updating the source: INT8 host offload
+requires the `engram_int8_lookup_cpu` CPU operator. Keep the Engram weights
+and their scale tensors available in the checkpoint. `--safetensors-load-strategy lazy`
+is required to avoid eagerly materializing the entire table on each rank.
+
+The [single-node offload example](../../../../examples/deepseek_v41/serve_a3_offload.sh)
+uses TP8/DP2/EP16 across all 16 logical devices, INT8 CPU tables, model runner
+V1, `FULL_DECODE_ONLY`, and DSpark with eager draft execution. Set `LOCAL_IP`,
+`NIC_NAME`, and `MODEL_PATH`, then run the script from an empty working directory:
+
+```bash
+export LOCAL_IP="<HOST_IP>"
+export NIC_NAME="<NETWORK_INTERFACE>"
+export MODEL_PATH="<YOUR_MODEL_PATH>"
+bash <REPO_ROOT>/examples/deepseek_v41/serve_a3_offload.sh
+```
+
+The initial limits are 4 sequences per DP replica, 512 batched tokens,
+131072 model length, and 1 GiB of KV cache per rank, with prefix caching
+disabled. Both `enable_engram` and `enable_engram_ple_offload` are enabled.
+Ensure enough host RAM for all compressed Engram shards and runtime memory;
+CPU/NUMA page migration can add several minutes to startup.
+
+This configuration passed model loading, decode graph capture, natural-text
+requests, and mixed-length concurrent request smoke tests. These checks do
+not establish dataset accuracy or performance. Other Engram storage formats
+and model runner V2 are not covered by this smoke validation.
 
 ## 6 Functional Verification
 

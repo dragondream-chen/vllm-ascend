@@ -9,6 +9,9 @@ set -euo pipefail
 : "${NIC_NAME:?Set NIC_NAME}"
 : "${MODEL_PATH:?Set MODEL_PATH}"
 
+# Weight loading and graph capture can exceed the default 600-second frontend timeout.
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+
 export HCCL_IF_IP="$LOCAL_IP"
 export GLOO_SOCKET_IFNAME="$NIC_NAME"
 export TP_SOCKET_IFNAME="$NIC_NAME"

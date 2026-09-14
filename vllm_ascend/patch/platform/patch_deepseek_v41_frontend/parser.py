@@ -38,27 +38,27 @@ def convert_arguments(raw_args, partial):
     return json.dumps(params, ensure_ascii=False)
 
 
-def v41_terminal(text):
-    return (
-        text.replace("｜DSML｜tool_calls", "｜DSML｜ calls")
-        .replace("｜DSML｜invoke", "｜DSML｜ invoke")
-        .replace("｜DSML｜parameter", "｜DSML｜ parameter")
-    )
-
-
 @cache
 def deepseek_v41_config(thinking):
     config = deepseek_v4_config(thinking=thinking)
-    terminals = {name: v41_terminal(text) for name, text in config.terminals.items()}
-    # The reference decoder treats these two newlines as the tool delimiter,
-    # not as part of the assistant's summary content.
-    terminals["TOOL_START"] = "\n\n<｜DSML｜ calls>"
+    # Override the V4 wire markers explicitly: upstream TOOL_START can be a
+    # tuple of V4 aliases, which must not become valid V4.1 tool delimiters.
+    terminal_overrides = {
+        "TOOL_START": "\n\n<｜DSML｜ calls>",
+        "TOOL_END": "</｜DSML｜ calls>",
+        "INVOKE_PREFIX": '<｜DSML｜ invoke name="',
+        "INVOKE_END": "</｜DSML｜ invoke>",
+        "PARAM_START": "<｜DSML｜ parameter",
+        "PARAM_CLOSE": "</｜DSML｜ parameter>",
+    }
     return replace(
         config,
         name="deepseek_v41",
-        terminals=terminals,
+        terminals={**config.terminals, **terminal_overrides},
         token_id_terminals={
-            name: v41_terminal(text) for name, text in config.token_id_terminals.items() if name != "TOOL_START"
+            name: terminal_overrides.get(name, text)
+            for name, text in config.token_id_terminals.items()
+            if name != "TOOL_START"
         },
         arg_converter=convert_arguments,
         strip_trailing_reasoning_whitespace=False,

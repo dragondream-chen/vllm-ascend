@@ -308,7 +308,8 @@ def test_loader_selects_compatible_index(tmp_path, storage, swap_indexes):
     fp8 = {key: bf16.to(torch.float8_e4m3fn), scale_key: torch.ones(5, 1).to(torch.float8_e8m0fnu)}
     quant = (
         {key: torch.full((5, 32), 7, dtype=torch.int8), scale_key: torch.ones(5, 1)}
-        if storage == "int8" else {key: bf16}
+        if storage == "int8"
+        else {key: bf16}
     )
     sources = (quant, fp8) if swap_indexes else (fp8, quant)
     for name, tensors in zip(("model", "quant_model_weights"), sources):
@@ -347,9 +348,7 @@ def test_int8_loads_bf16_source_without_scale(tmp_path):
     weights = torch.linspace(-12, 12, 19 * 32).reshape(19, 32).bfloat16()
     save_file({key: weights}, tmp_path / "weights.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: "weights.safetensors"}}))
-    table = hbm.NodeShardedEngram(
-        19, 32, SimpleNamespace(size=4, rank=3), storage_format="int8", cpu_offload=True
-    )
+    table = hbm.NodeShardedEngram(19, 32, SimpleNamespace(size=4, rank=3), storage_format="int8", cpu_offload=True)
     table.load_checkpoint(tmp_path, key, chunk_rows=2)
     codes, scales = hbm.quantize_engram_rows(weights[15:19])
     assert torch.equal(table.weight, codes)

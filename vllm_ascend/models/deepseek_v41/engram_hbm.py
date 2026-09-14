@@ -348,7 +348,8 @@ class NodeShardedEngram(nn.Module):
                 with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
                     scale = sf.get_slice(scale_key)
                     if scale.get_shape() != [self.rows, self.width // 32] or scale.get_dtype() not in (
-                        "F8_E8M0", "F8_E8M0FNU"
+                        "F8_E8M0",
+                        "F8_E8M0FNU",
                     ):
                         raise ValueError(f"{scale_key}: expected FP8 UE8M0 [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):

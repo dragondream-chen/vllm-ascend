@@ -22,19 +22,15 @@ CHUNK_ROWS = 1 << 22
 
 
 def eng_cpu_offload(vllm_config) -> bool:
-    """Whether the Engram table is offloaded to host memory.
+    """Whether the Engram table is offloaded to host memory (UVA lookup)."""
 
-    The switch is vLLM's ``--engram-config`` ``cpu_offload`` field.  The
-    Ascend knob keeps the current behaviour on vLLM builds that predate that
-    config, so no second option is introduced here.
-    """
+    return bool(vllm_config.engram_config.cpu_offload)
 
-    config = getattr(vllm_config, "engram_config", None)
-    if config is not None:
-        return bool(config.cpu_offload)
-    from vllm_ascend.ascend_config import get_ascend_config
 
-    return bool(get_ascend_config().enable_engram_ple_offload)
+def engram_enabled(text_config) -> bool:
+    """Whether the checkpoint declares Engram n-gram layers."""
+
+    return bool(getattr(text_config, "engram_layer_ids", None))
 
 
 def _host_library() -> ctypes.CDLL:

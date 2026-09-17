@@ -262,10 +262,11 @@ class NodeShardedEngram(nn.Module):
                 # previous expression materialized a separate BF16 tensor
                 # before this copy, doubling the temporary decoded allocation.
                 if self.storage_format == "int8":
-                    from vllm_ascend import vllm_ascend_C  # noqa: F401
-
-                    torch.ops._C_ascend.engram_int8_lookup_cpu(
-                        self.weight, self.weight_scale, flat_ids.contiguous(), decoded_slot
+                    decoded_slot.copy_(
+                        dequantize_engram_rows(
+                            torch.index_select(self.weight, 0, flat_ids),
+                            torch.index_select(self.weight_scale, 0, flat_ids),
+                        )
                     )
                 elif self.storage_format == "bf16":
                     torch.index_select(self.weight, 0, flat_ids, out=decoded_slot)
@@ -274,11 +275,9 @@ class NodeShardedEngram(nn.Module):
                 rows = decoded_slot
             else:
                 if self.storage_format == "int8":
-                    from vllm_ascend import vllm_ascend_C  # noqa: F401
-
-                    rows = torch.empty((flat_ids.numel(), self.width), dtype=torch.bfloat16, device="cpu")
-                    torch.ops._C_ascend.engram_int8_lookup_cpu(
-                        self.weight, self.weight_scale, flat_ids.contiguous(), rows
+                    rows = dequantize_engram_rows(
+                        torch.index_select(self.weight, 0, flat_ids),
+                        torch.index_select(self.weight_scale, 0, flat_ids),
                     )
                 elif self.storage_format == "bf16":
                     rows = torch.index_select(self.weight, 0, flat_ids)

@@ -78,6 +78,7 @@ from .compressor import DeepseekV41Compressor
 from .engram_gate import engram_gate
 from .engram_hash import PagedNgramHistory
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
+from .engram_host_uva import eng_cpu_offload
 from .indexer import DeepseekV41Indexer
 
 
@@ -1005,7 +1006,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     config.engram_head_dim,
                     query_group,
                     storage_format=storage_format,
-                    cpu_offload=ascend_config.enable_engram_ple_offload,
+                    cpu_offload=eng_cpu_offload(vllm_config),
                 )
         self.engram_history = None
         self._engram_input_buffers = None

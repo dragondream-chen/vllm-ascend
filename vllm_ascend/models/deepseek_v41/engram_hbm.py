@@ -133,20 +133,18 @@ class NodeShardedEngram(nn.Module):
             )
         codes = self._host_uva[0].tensor if self._host_uva is not None else None
         self.weight = nn.Parameter(
-            (
-                codes
-                if codes is not None
-                else torch.empty(
-                    self.end - self.start,
-                    width,
-                    dtype=(
-                        torch.int8
-                        if storage_format == "int8"
-                        else (torch.float8_e4m3fn if storage_format in ("fp8", "mxfp8") else torch.bfloat16)
-                    ),
-                    device=storage_device,
-                    pin_memory=False,
+            codes
+            if codes is not None
+            else torch.empty(
+                self.end - self.start,
+                width,
+                dtype=(
+                    torch.int8
+                    if storage_format == "int8"
+                    else (torch.float8_e4m3fn if storage_format in ("fp8", "mxfp8") else torch.bfloat16)
                 ),
+                device=storage_device,
+                pin_memory=False,
             ),
             requires_grad=False,
         )

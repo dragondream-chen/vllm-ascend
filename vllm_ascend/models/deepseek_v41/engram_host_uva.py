@@ -97,19 +97,18 @@ def _engram_host_uva_kernel(
     rows,
     CHUNK: tl.constexpr,
     WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = row < rows
-    index = tl.load(ids + row, valid, other=0).to(tl.int64)
-    chunk = index // CHUNK
-    local = index % CHUNK
-    codes = tl.load(codes_ptrs + chunk).to(tl.pointer_type(tl.int8))
-    scales = tl.load(scales_ptrs + chunk).to(tl.pointer_type(tl.float32))
-    col = tl.arange(0, WIDTH)
-    value = tl.load(codes + local[:, None] * WIDTH + col[None, :], valid[:, None], other=0).to(tl.float32)
-    scale = tl.load(scales + local[:, None] * (WIDTH // 32) + col[None, :] // 32, valid[:, None], other=0)
-    tl.store(output + row[:, None] * WIDTH + col[None, :], (value * scale).to(tl.bfloat16), valid[:, None])
+    row = tl.program_id(0)
+    if row < rows:
+        index = tl.load(ids + row).to(tl.int64)
+        chunk = index // CHUNK
+        local = index % CHUNK
+        codes = tl.load(codes_ptrs + chunk).to(tl.pointer_type(tl.int8))
+        scales = tl.load(scales_ptrs + chunk).to(tl.pointer_type(tl.float32))
+        col = tl.arange(0, WIDTH)
+        value = tl.load(codes + local * WIDTH + col).to(tl.float32)
+        scale = tl.load(scales + local * (WIDTH // 32) + col // 32)
+        tl.store(output + row * WIDTH + col, (value * scale).to(tl.bfloat16))
 
 
 def gather_dequantize_host_uva(codes: HostUvaBuffer, scales: HostUvaBuffer, ids: torch.Tensor) -> torch.Tensor:
@@ -119,7 +118,7 @@ def gather_dequantize_host_uva(codes: HostUvaBuffer, scales: HostUvaBuffer, ids:
     output = torch.empty((rows, 256), dtype=torch.bfloat16, device=ids.device)
     if rows == 0:
         return output
-    _engram_host_uva_kernel[(triton.cdiv(rows, 8),)](
+    _engram_host_uva_kernel[(rows,)](
         codes.ptrs,
         scales.ptrs,
         ids.reshape(-1).to(torch.int64),
@@ -127,7 +126,6 @@ def gather_dequantize_host_uva(codes: HostUvaBuffer, scales: HostUvaBuffer, ids:
         rows,
         CHUNK=CHUNK_ROWS,
         WIDTH=256,
-        BLOCK=8,
         num_warps=4,
     )
     return output
